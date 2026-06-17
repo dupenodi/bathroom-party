@@ -1,37 +1,42 @@
 // background.js — Service worker
-// Owns capture state. All audio work happens in the offscreen doc.
+// Owns capture state for every tab. All audio work happens in the offscreen doc.
+// Multiple tabs can be processed at once (e.g. Spotify + YouTube); each has its
+// own DSP session inside the single offscreen document.
 
-let isCapturing = false;
-let capturedTabId = null;
+let capturedTabs = new Set(); // tabIds currently being processed
 
-async function persistCaptureState() {
-  await chrome.storage.local.set({
-    captureState: { isCapturing, capturedTabId }
-  });
+async function persistState() {
+  await chrome.storage.local.set({ capturedTabs: [...capturedTabs] });
 }
 
-// Offscreen doc is the source of truth — SW memory resets when it sleeps.
-async function reconcileCaptureState() {
-  const exists = await offscreenExists();
-  if (exists) {
-    if (!isCapturing) {
-      const stored = await chrome.storage.local.get(['captureState']);
-      isCapturing = true;
-      capturedTabId = stored.captureState?.capturedTabId ?? null;
+// The offscreen doc is the source of truth — SW memory resets when it sleeps.
+async function reconcileState() {
+  if (await offscreenExists()) {
+    try {
+      const resp = await forwardToOffscreen({ type: 'OFFSCREEN_QUERY' });
+      capturedTabs = new Set(resp?.tabs ?? []);
+    } catch (_) {
+      // Offscreen not answering yet — keep whatever we have
     }
-  } else if (isCapturing) {
-    isCapturing = false;
-    capturedTabId = null;
-    await persistCaptureState();
+  } else {
+    capturedTabs = new Set();
   }
-  return { isCapturing, capturedTabId };
+  await persistState();
+  return [...capturedTabs];
 }
 
-reconcileCaptureState();
+reconcileState();
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.type === 'GET_STATE') {
-    reconcileCaptureState().then(sendResponse);
+    reconcileState().then((tabs) => {
+      const tabId = msg.tabId;
+      sendResponse({
+        isCapturing: tabId != null && capturedTabs.has(tabId),
+        activeCount: tabs.length,
+        tabs
+      });
+    });
     return true;
   }
   if (msg.type === 'START_CAPTURE') {
@@ -39,7 +44,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
   if (msg.type === 'STOP_CAPTURE') {
-    stopCapture().then(sendResponse);
+    stopCapture(msg.tabId).then(sendResponse);
     return true;
   }
   if (msg.type === 'UPDATE_SETTINGS') {
@@ -48,6 +53,16 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       .catch(e => sendResponse({ success: false, error: e.message }));
     return true;
   }
+  if (msg.type === 'SESSION_ENDED') {
+    // Offscreen tells us a tab's stream ended (tab closed or navigated away)
+    handleSessionEnded(msg.tabId).then(() => sendResponse({ success: true }));
+    return true;
+  }
+});
+
+// A captured tab being closed should free its session.
+chrome.tabs.onRemoved.addListener((tabId) => {
+  if (capturedTabs.has(tabId)) stopCapture(tabId);
 });
 
 async function offscreenExists() {
@@ -87,8 +102,8 @@ async function forwardToOffscreen(msg, retries = 3) {
 
 async function startCapture(tabId, settings) {
   try {
-    // Always start clean — tear down any stale offscreen
-    await destroyOffscreen();
+    // Don't tear down the offscreen doc — other tabs may be playing through it.
+    await ensureOffscreen();
 
     const streamId = await new Promise((resolve, reject) => {
       chrome.tabCapture.getMediaStreamId({ targetTabId: tabId }, (id) => {
@@ -97,35 +112,44 @@ async function startCapture(tabId, settings) {
       });
     });
 
-    await ensureOffscreen();
-
-    const response = await forwardToOffscreen({ type: 'OFFSCREEN_START', streamId, settings });
+    const response = await forwardToOffscreen({
+      type: 'OFFSCREEN_START', tabId, streamId, settings
+    });
 
     if (response?.success) {
-      isCapturing = true;
-      capturedTabId = tabId;
-      await persistCaptureState();
-      return { success: true };
+      capturedTabs.add(tabId);
+      await persistState();
+      return { success: true, activeCount: capturedTabs.size };
     }
-    await destroyOffscreen();
+
+    // Failed to start this tab; only tear down if nothing else is running.
+    if (capturedTabs.size === 0) await destroyOffscreen();
     return { success: false, error: response?.error || 'Audio processor failed to start' };
   } catch (err) {
-    await destroyOffscreen();
+    if (capturedTabs.size === 0) await destroyOffscreen();
     return { success: false, error: err.message };
   }
 }
 
-async function stopCapture() {
+async function stopCapture(tabId) {
   try {
     if (await offscreenExists()) {
-      try { await forwardToOffscreen({ type: 'OFFSCREEN_STOP' }); } catch (_) {}
+      try { await forwardToOffscreen({ type: 'OFFSCREEN_STOP', tabId }); } catch (_) {}
     }
-    await destroyOffscreen();
-    isCapturing = false;
-    capturedTabId = null;
-    await persistCaptureState();
-    return { success: true };
+    capturedTabs.delete(tabId);
+
+    // Free the offscreen document once the last tab stops.
+    if (capturedTabs.size === 0) await destroyOffscreen();
+
+    await persistState();
+    return { success: true, activeCount: capturedTabs.size };
   } catch (err) {
     return { success: false, error: err.message };
   }
+}
+
+async function handleSessionEnded(tabId) {
+  capturedTabs.delete(tabId);
+  if (capturedTabs.size === 0) await destroyOffscreen();
+  await persistState();
 }

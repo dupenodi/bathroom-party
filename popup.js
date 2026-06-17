@@ -17,8 +17,10 @@ const muffleVal    = document.getElementById('muffleVal');
 const bassVal      = document.getElementById('bassVal');
 const resetBtn     = document.getElementById('resetBtn');
 
-let isActive  = false;
-let isLoading = false;
+let isActive    = false;
+let isLoading   = false;
+let activeTabId = null;   // the tab this popup controls
+let activeCount = 0;      // total tabs currently in the bathroom
 
 // ── Init ─────────────────────────────────────────────────────────────
 chrome.storage.local.get(['settings'], ({ settings }) => {
@@ -30,10 +32,27 @@ chrome.storage.local.get(['settings'], ({ settings }) => {
   refreshDisplays();
 });
 
-chrome.runtime.sendMessage({ type: 'GET_STATE' }, (resp) => {
-  if (chrome.runtime.lastError) return;
-  if (resp?.isCapturing) setActive(true);
-});
+initActiveTab();
+
+async function initActiveTab() {
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  activeTabId = tab?.id ?? null;
+
+  const state = await sendMessage({ type: 'GET_STATE', tabId: activeTabId });
+  if (!state) return;
+  activeCount = state.activeCount || 0;
+  setActive(!!state.isCapturing);
+}
+
+// Promise wrapper that swallows disconnected-port errors
+function sendMessage(msg) {
+  return new Promise((resolve) => {
+    chrome.runtime.sendMessage(msg, (resp) => {
+      if (chrome.runtime.lastError) return resolve(null);
+      resolve(resp);
+    });
+  });
+}
 
 // ── Helpers ───────────────────────────────────────────────────────────
 function getSettings() {
@@ -74,6 +93,27 @@ function updateFill(el) {
   el.style.setProperty('--fill', pct + '%');
 }
 
+// How many OTHER tabs are active besides this one
+function otherActiveCount() {
+  return Math.max(0, activeCount - (isActive ? 1 : 0));
+}
+
+function updateFooter() {
+  if (isActive) {
+    footerText.textContent = 'processing';
+    footerText.className   = 'footer-text active';
+  } else {
+    const others = otherActiveCount();
+    if (others > 0) {
+      footerText.textContent = others + (others === 1 ? ' other tab' : ' other tabs');
+      footerText.className    = 'footer-text active';
+    } else {
+      footerText.textContent = 'idle';
+      footerText.className    = 'footer-text';
+    }
+  }
+}
+
 function setActive(active) {
   isActive = active;
   toggle.classList.toggle('on', active);
@@ -84,17 +124,13 @@ function setActive(active) {
   if (active) {
     powerSub.textContent  = 'you\'re in the bathroom';
     powerSub.className    = 'power-sub on';
-    footerText.textContent = 'processing';
-    footerText.className   = 'footer-text active';
-    // Give sliders the live fill treatment
     [depthSlider, muffleSlider, bassSlider].forEach(s => s.classList.add('live'));
   } else {
     powerSub.textContent  = 'off — tap to enter';
     powerSub.className    = 'power-sub';
-    footerText.textContent = 'idle';
-    footerText.className   = 'footer-text';
     [depthSlider, muffleSlider, bassSlider].forEach(s => s.classList.remove('live'));
   }
+  updateFooter();
 }
 
 function setLoading(loading, msg = '') {
@@ -110,15 +146,19 @@ function setLoading(loading, msg = '') {
 toggle.addEventListener('click', async () => {
   if (isLoading) return;
 
-  const state = await chrome.runtime.sendMessage({ type: 'GET_STATE' });
-  const actuallyCapturing = !chrome.runtime.lastError && state?.isCapturing;
-  if (actuallyCapturing !== isActive) setActive(actuallyCapturing);
+  // Re-sync with the real per-tab state before acting (SW may have slept)
+  const state = await sendMessage({ type: 'GET_STATE', tabId: activeTabId });
+  if (state) {
+    activeCount = state.activeCount || 0;
+    if (!!state.isCapturing !== isActive) setActive(!!state.isCapturing);
+  }
 
-  if (actuallyCapturing) {
+  if (isActive) {
     setLoading(true, 'stepping out...');
-    const resp = await chrome.runtime.sendMessage({ type: 'STOP_CAPTURE' });
+    const resp = await sendMessage({ type: 'STOP_CAPTURE', tabId: activeTabId });
     setLoading(false);
     if (resp?.success) {
+      activeCount = resp.activeCount ?? Math.max(0, activeCount - 1);
       setActive(false);
     } else {
       powerSub.textContent = 'error stopping';
@@ -129,23 +169,23 @@ toggle.addEventListener('click', async () => {
 
   setLoading(true, 'finding the bathroom...');
 
-  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  if (!tab?.id) {
+  if (activeTabId == null) {
     setLoading(false);
     powerSub.textContent = 'no active tab';
     powerSub.className   = 'power-sub err';
     return;
   }
 
-  const resp = await chrome.runtime.sendMessage({
+  const resp = await sendMessage({
     type: 'START_CAPTURE',
-    tabId: tab.id,
+    tabId: activeTabId,
     settings: getSettings()
   });
 
   setLoading(false);
 
   if (resp?.success) {
+    activeCount = resp.activeCount ?? activeCount + 1;
     setActive(true);
   } else {
     let msg = resp?.error || 'unknown error';
@@ -162,17 +202,16 @@ toggle.addEventListener('click', async () => {
 });
 
 // ── Slider live updates ───────────────────────────────────────────────
-// These fire on every input event (continuous drag) and immediately
-// update the running audio nodes via offscreen message
-function onSliderInput(e) {
+// Settings are global — they apply to every tab currently in the bathroom.
+function onSliderInput() {
   refreshDisplays();
-  if (!isActive) return;
 
   const settings = getSettings();
   chrome.storage.local.set({ settings });
 
-  // Send directly — background forwards to offscreen which updates nodes in-place
-  chrome.runtime.sendMessage({ type: 'UPDATE_SETTINGS', settings });
+  if (activeCount > 0) {
+    chrome.runtime.sendMessage({ type: 'UPDATE_SETTINGS', settings });
+  }
 }
 
 depthSlider.addEventListener('input',  onSliderInput);
