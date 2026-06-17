@@ -228,6 +228,33 @@
       );
     }
 
+  /* ── Reset ── */
+    .reset-row {
+      display: flex;
+      justify-content: flex-end;
+      padding: 0 20px 14px;
+    }
+
+    .reset-btn {
+      background: none;
+      border: 1px solid #222;
+      color: #444;
+      font-family: inherit;
+      font-size: 9px;
+      font-weight: 500;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      padding: 4px 8px;
+      border-radius: 2px;
+      cursor: pointer;
+      transition: color 0.15s, border-color 0.15s;
+    }
+
+    .reset-btn:hover {
+      color: #c9a84c;
+      border-color: #c9a84c44;
+    }
+
     /* ── Divider ── */
     .divider {
       height: 1px;
@@ -356,6 +383,10 @@
       <input type="range" id="bassSlider" min="0" max="100" value="65">
     </div>
 
+  </div>
+
+  <div class="reset-row">
+    <button class="reset-btn" id="resetBtn" type="button">reset defaults</button>
   </div>
 
   <div class="divider"></div>

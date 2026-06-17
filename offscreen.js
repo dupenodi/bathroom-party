@@ -77,13 +77,13 @@ function buildDSPChain() {
   lowpassNode.type = 'lowpass';
   lowpassNode.Q.value = 0.9;
 
-  // 2. Second lowpass in series — steeper roll-off for convincing wall effect
+  // 2. Second lowpass in series — cutoff tracks muffle for steeper roll-off
   hiCutNode = ctx.createBiquadFilter();
   hiCutNode.type = 'lowpass';
-  hiCutNode.frequency.value = 2200;
+  hiCutNode.frequency.value = 1200;
   hiCutNode.Q.value = 0.5;
 
-  // 3. Bass shelf boost — the kick/bass thumps through walls
+  // 3. Bass shelf boost — applied after compression so it isn't squashed
   bassBoostNode = ctx.createBiquadFilter();
   bassBoostNode.type = 'lowshelf';
   bassBoostNode.frequency.value = 90;
@@ -99,36 +99,36 @@ function buildDSPChain() {
   // Post-mix dynamics compressor: evens out level spikes from reverb
   // Keeps perceived volume consistent regardless of effect depth
   compNode = ctx.createDynamicsCompressor();
-  compNode.threshold.value = -18;
-  compNode.knee.value      =  8;
-  compNode.ratio.value     =  4;
+  compNode.threshold.value = -22;
+  compNode.knee.value      =  10;
+  compNode.ratio.value     =  3;
   compNode.attack.value    =  0.004;
   compNode.release.value   =  0.18;
 
   // Makeup gain after compression to restore perceived loudness
   masterGainNode = ctx.createGain();
-  masterGainNode.gain.value = 1.6;
+  masterGainNode.gain.value = 1.75;
 
   // ── Routing ──────────────────────────────────────────────────────────
   //
-  //  source ─┬─► lowpass ─► hiCut ─► bass ─► convolver ─► wetGain ─┐
-  //          │                                                       ├─► compressor ─► master ─► out
-  //          └─────────────────────────────────────────► dryGain ───┘
+  //  source ─┬─► lowpass ─► hiCut ─► convolver ─► wetGain ─┐
+  //          │                                              ├─► compressor ─► bass ─► master ─► out
+  //          └──────────────────────────────────► dryGain ─┘
   //
-  // The dry path passes unfiltered signal (tiny amount) so there's
-  // just a ghost of the original — like sound sneaking under the door.
+  // Bass sits after compression so the shelf boost isn't squashed.
+  // Muffle filters only the wet path; dry bleed fades as muffle rises.
 
   sourceNode.connect(lowpassNode);
   lowpassNode.connect(hiCutNode);
-  hiCutNode.connect(bassBoostNode);
-  bassBoostNode.connect(convolverNode);
+  hiCutNode.connect(convolverNode);
   convolverNode.connect(wetGainNode);
   wetGainNode.connect(compNode);
 
   sourceNode.connect(dryGainNode);
   dryGainNode.connect(compNode);
 
-  compNode.connect(masterGainNode);
+  compNode.connect(bassBoostNode);
+  bassBoostNode.connect(masterGainNode);
   masterGainNode.connect(ctx.destination);
 }
 
@@ -139,27 +139,34 @@ function applySettings() {
   const tau = 0.04; // smooth transition constant (40ms)
   const { depth, bass, muffle } = currentSettings;
 
+  // Curved mapping: effects kick in earlier so defaults feel strong,
+  // 0% stays subtle, 100% pushes past the old ceiling.
+  const d = Math.pow(depth,  0.8);
+  const m = Math.pow(muffle, 0.42);
+  const b = Math.pow(bass,   0.62);
+
   // ── Wet/dry mix ─────────────────────────────────────────────────────
-  // wet: 0.55–1.1, dry: 0.18–0.0
-  // At full depth: almost all wet, dry vanishes
-  const wetLevel = 0.55 + depth * 0.55;
-  const dryLevel = 0.18 * (1 - depth * 0.95);
+  // depth=0 → light room tint, depth=1 → fully drowned in the stall
+  const wetLevel = 0.15 + d * 1.1;
+  const dryLevel = 0.35 * (1 - Math.pow(depth, 1.2)) * (1 - m * 0.9);
   wetGainNode.gain.setTargetAtTime(wetLevel, t, tau);
   dryGainNode.gain.setTargetAtTime(dryLevel, t, tau);
 
-  // ── Lowpass cutoff ──────────────────────────────────────────────────
-  // muffle=0 → 1600Hz (mild), muffle=1 → 380Hz (deep in the stall)
-  const lpFreq = 1600 - muffle * 1220;
+  // ── Muffle: dual lowpass — defaults land ~750Hz, max is phone-dark ──
+  const lpFreq    = 3100 - m * 2850;
+  const hiCutFreq = 4400 - m * 4050;
   lowpassNode.frequency.setTargetAtTime(lpFreq, t, tau);
+  hiCutNode.frequency.setTargetAtTime(hiCutFreq, t, tau);
+  lowpassNode.Q.setTargetAtTime(0.6 + m * 2.6, t, tau);
+  hiCutNode.Q.setTargetAtTime(0.4 + m * 1.6, t, tau);
 
-  // ── Bass shelf gain ─────────────────────────────────────────────────
-  // bass=0 → +3dB, bass=1 → +14dB (real thump)
-  const bassGain = 3 + bass * 11;
+  // ── Bass shelf — defaults ~+17dB, max +24dB wall thump ────────────
+  const bassGain = b * 24;
   bassBoostNode.gain.setTargetAtTime(bassGain, t, tau);
+  bassBoostNode.frequency.setTargetAtTime(55 + b * 95, t, tau);
 
   // ── Master makeup gain ──────────────────────────────────────────────
-  // Slightly bump master when dry signal is low so volume stays stable
-  const makeup = 1.4 + depth * 0.35;
+  const makeup = 1.55 + d * 0.6;
   masterGainNode.gain.setTargetAtTime(makeup, t, tau);
 }
 
@@ -178,7 +185,7 @@ function stopProcessing() {
 // bright initial decay, rapid high-frequency absorption, ~0.9s total decay
 function generateBathroomIR(ctx) {
   const sr     = ctx.sampleRate;
-  const dur    = 0.9;             // slightly longer for more 'room' feel
+  const dur    = 1.1;             // longer tail for a more obvious room
   const length = Math.floor(sr * dur);
   const ir     = ctx.createBuffer(2, length, sr);
 
@@ -192,25 +199,24 @@ function generateBathroomIR(ctx) {
       let s = Math.random() * 2 - 1;
 
       // Early reflections: dense cluster 6–18ms (tile walls close together)
-      const er = t < 0.018
-        ? Math.exp(-t * 140) * 2.2
+      const er = t < 0.022
+        ? Math.exp(-t * 120) * 2.8
         : 0;
 
-      // Main exponential decay — tuned for a ~0.9s RT60
-      const decay = Math.exp(-t * 7.5);
+      // Main exponential decay — tuned for a ~1.1s RT60
+      const decay = Math.exp(-t * 6.2);
 
       // High-frequency air absorption: tiles reflect highs but air absorbs them
-      // Approximate by rolling off a portion of the signal at higher time values
       const hfDamp = t > 0.05
-        ? Math.pow(0.5, t * 5.5)   // HF content halves roughly every 125ms
+        ? Math.pow(0.5, t * 5.5)
         : 1.0;
 
       // Combine: early reflections bright, tail increasingly dull
       const hfComponent = s * decay * hfDamp;
       const lfComponent = s * decay;
-      s = hfComponent * 0.4 + lfComponent * 0.6;
+      s = hfComponent * 0.35 + lfComponent * 0.65;
 
-      data[i] = (s + er * (Math.random() * 2 - 1)) * 0.28;
+      data[i] = (s + er * (Math.random() * 2 - 1)) * 0.36;
     }
 
     // Right channel: slight delay (~0.7ms = 30 samples) for stereo width

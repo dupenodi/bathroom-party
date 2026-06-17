@@ -1,5 +1,7 @@
 // popup.js
 
+const DEFAULTS = { depth: 78, muffle: 65, bass: 65 };
+
 const toggle    = document.getElementById('toggle');
 const powerSub  = document.getElementById('powerSub');
 const sliders   = document.getElementById('sliders');
@@ -13,6 +15,7 @@ const bassSlider   = document.getElementById('bassSlider');
 const depthVal     = document.getElementById('depthVal');
 const muffleVal    = document.getElementById('muffleVal');
 const bassVal      = document.getElementById('bassVal');
+const resetBtn     = document.getElementById('resetBtn');
 
 let isActive  = false;
 let isLoading = false;
@@ -28,6 +31,7 @@ chrome.storage.local.get(['settings'], ({ settings }) => {
 });
 
 chrome.runtime.sendMessage({ type: 'GET_STATE' }, (resp) => {
+  if (chrome.runtime.lastError) return;
   if (resp?.isCapturing) setActive(true);
 });
 
@@ -38,6 +42,20 @@ function getSettings() {
     muffle: muffleSlider.value / 100,
     bass:   bassSlider.value   / 100
   };
+}
+
+function applyDefaults() {
+  depthSlider.value  = DEFAULTS.depth;
+  muffleSlider.value = DEFAULTS.muffle;
+  bassSlider.value   = DEFAULTS.bass;
+  refreshDisplays();
+
+  const settings = getSettings();
+  chrome.storage.local.set({ settings });
+
+  if (isActive) {
+    chrome.runtime.sendMessage({ type: 'UPDATE_SETTINGS', settings });
+  }
 }
 
 function refreshDisplays() {
@@ -92,7 +110,11 @@ function setLoading(loading, msg = '') {
 toggle.addEventListener('click', async () => {
   if (isLoading) return;
 
-  if (isActive) {
+  const state = await chrome.runtime.sendMessage({ type: 'GET_STATE' });
+  const actuallyCapturing = !chrome.runtime.lastError && state?.isCapturing;
+  if (actuallyCapturing !== isActive) setActive(actuallyCapturing);
+
+  if (actuallyCapturing) {
     setLoading(true, 'stepping out...');
     const resp = await chrome.runtime.sendMessage({ type: 'STOP_CAPTURE' });
     setLoading(false);
@@ -156,5 +178,7 @@ function onSliderInput(e) {
 depthSlider.addEventListener('input',  onSliderInput);
 muffleSlider.addEventListener('input', onSliderInput);
 bassSlider.addEventListener('input',   onSliderInput);
+
+resetBtn.addEventListener('click', applyDefaults);
 
 refreshDisplays();

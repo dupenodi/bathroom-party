@@ -4,9 +4,34 @@
 let isCapturing = false;
 let capturedTabId = null;
 
+async function persistCaptureState() {
+  await chrome.storage.local.set({
+    captureState: { isCapturing, capturedTabId }
+  });
+}
+
+// Offscreen doc is the source of truth — SW memory resets when it sleeps.
+async function reconcileCaptureState() {
+  const exists = await offscreenExists();
+  if (exists) {
+    if (!isCapturing) {
+      const stored = await chrome.storage.local.get(['captureState']);
+      isCapturing = true;
+      capturedTabId = stored.captureState?.capturedTabId ?? null;
+    }
+  } else if (isCapturing) {
+    isCapturing = false;
+    capturedTabId = null;
+    await persistCaptureState();
+  }
+  return { isCapturing, capturedTabId };
+}
+
+reconcileCaptureState();
+
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.type === 'GET_STATE') {
-    sendResponse({ isCapturing, capturedTabId });
+    reconcileCaptureState().then(sendResponse);
     return true;
   }
   if (msg.type === 'START_CAPTURE') {
@@ -79,6 +104,7 @@ async function startCapture(tabId, settings) {
     if (response?.success) {
       isCapturing = true;
       capturedTabId = tabId;
+      await persistCaptureState();
       return { success: true };
     }
     await destroyOffscreen();
@@ -97,6 +123,7 @@ async function stopCapture() {
     await destroyOffscreen();
     isCapturing = false;
     capturedTabId = null;
+    await persistCaptureState();
     return { success: true };
   } catch (err) {
     return { success: false, error: err.message };
