@@ -1,0 +1,377 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Bathroom Party</title>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&display=swap');
+
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      width: 300px;
+      background: #0a0a08;
+      color: #d4cfc4;
+      font-family: 'Space Grotesk', 'Helvetica Neue', sans-serif;
+      overflow: hidden;
+    }
+
+    /* ── Noise texture overlay ── */
+    body::before {
+      content: '';
+      position: fixed;
+      inset: 0;
+      background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.06'/%3E%3C/svg%3E");
+      pointer-events: none;
+      z-index: 100;
+      opacity: 0.4;
+    }
+
+    /* ── Header ── */
+    .top {
+      padding: 20px 20px 16px;
+      border-bottom: 1px solid #1c1c18;
+      position: relative;
+    }
+
+    .eyebrow {
+      font-size: 9px;
+      letter-spacing: 0.22em;
+      text-transform: uppercase;
+      color: #3d3d35;
+      margin-bottom: 6px;
+    }
+
+    .title {
+      font-size: 26px;
+      font-weight: 700;
+      line-height: 0.95;
+      color: #e8e2d4;
+      letter-spacing: -0.02em;
+    }
+
+    .title em {
+      font-style: normal;
+      color: #c9a84c;
+    }
+
+    .year-badge {
+      position: absolute;
+      top: 20px;
+      right: 20px;
+      font-size: 10px;
+      font-weight: 500;
+      letter-spacing: 0.1em;
+      color: #3d3d35;
+      border: 1px solid #222;
+      padding: 3px 7px;
+      border-radius: 2px;
+    }
+
+    /* ── Power row ── */
+    .power-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 18px 20px;
+      border-bottom: 1px solid #1c1c18;
+    }
+
+    .power-label-group {
+      display: flex;
+      flex-direction: column;
+      gap: 3px;
+    }
+
+    .power-label {
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: #6b6b5e;
+    }
+
+    .power-sub {
+      font-size: 10px;
+      color: #333;
+      letter-spacing: 0.02em;
+    }
+
+    .power-sub.on  { color: #c9a84c; }
+    .power-sub.err { color: #a85a4c; }
+
+    /* ── Big toggle button ── */
+    .big-toggle {
+      width: 64px;
+      height: 34px;
+      background: #111110;
+      border: 1px solid #2a2a24;
+      border-radius: 17px;
+      cursor: pointer;
+      position: relative;
+      transition: border-color 0.25s;
+      flex-shrink: 0;
+    }
+
+    .big-toggle::after {
+      content: '';
+      position: absolute;
+      width: 24px;
+      height: 24px;
+      background: #2a2a24;
+      border-radius: 50%;
+      top: 4px;
+      left: 4px;
+      transition: transform 0.22s cubic-bezier(0.4,0,0.2,1), background 0.22s;
+    }
+
+    .big-toggle.on {
+      border-color: #c9a84c44;
+      background: #14120a;
+    }
+
+    .big-toggle.on::after {
+      transform: translateX(30px);
+      background: #c9a84c;
+    }
+
+    .big-toggle.loading {
+      opacity: 0.45;
+      pointer-events: none;
+    }
+
+    /* ── Sliders ── */
+    .sliders {
+      padding: 18px 20px 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+      transition: opacity 0.2s;
+    }
+
+    .sliders.locked {
+      opacity: 0.22;
+      pointer-events: none;
+    }
+
+    .slider-row {
+      display: flex;
+      flex-direction: column;
+      gap: 7px;
+    }
+
+    .slider-meta {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+    }
+
+    .slider-name {
+      font-size: 10px;
+      font-weight: 600;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+      color: #5a5a4e;
+    }
+
+    .slider-hint {
+      font-size: 9px;
+      color: #333;
+      letter-spacing: 0.04em;
+    }
+
+    .slider-val {
+      font-size: 10px;
+      font-weight: 500;
+      color: #5a5a4e;
+      font-variant-numeric: tabular-nums;
+      min-width: 30px;
+      text-align: right;
+    }
+
+    input[type=range] {
+      -webkit-appearance: none;
+      width: 100%;
+      height: 2px;
+      background: #1e1e18;
+      outline: none;
+      cursor: pointer;
+      border-radius: 1px;
+    }
+
+    input[type=range]::-webkit-slider-thumb {
+      -webkit-appearance: none;
+      width: 14px;
+      height: 14px;
+      background: #2e2e28;
+      border: 1.5px solid #4a4a40;
+      border-radius: 50%;
+      cursor: pointer;
+      transition: background 0.15s, border-color 0.15s, transform 0.1s;
+    }
+
+    input[type=range]:hover::-webkit-slider-thumb,
+    input[type=range]:active::-webkit-slider-thumb {
+      background: #c9a84c;
+      border-color: #c9a84c;
+      transform: scale(1.15);
+    }
+
+    /* Track fill using background gradient trick */
+    input[type=range].live {
+      background: linear-gradient(
+        to right,
+        #c9a84c44 0%,
+        #c9a84c44 var(--fill, 65%),
+        #1e1e18 var(--fill, 65%),
+        #1e1e18 100%
+      );
+    }
+
+    /* ── Divider ── */
+    .divider {
+      height: 1px;
+      background: #1c1c18;
+      margin: 0;
+    }
+
+    /* ── Footer ── */
+    .footer {
+      padding: 11px 20px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .status-dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: #2a2a24;
+      flex-shrink: 0;
+    }
+
+    .status-dot.active {
+      background: #c9a84c;
+      animation: throb 2.4s ease-in-out infinite;
+    }
+
+    @keyframes throb {
+      0%, 100% { opacity: 1; }
+      50%       { opacity: 0.25; }
+    }
+
+    .footer-text {
+      font-size: 9px;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      color: #333;
+    }
+
+    .footer-text.active { color: #c9a84c55; }
+
+    /* Speaker bars */
+    .bars {
+      margin-left: auto;
+      display: flex;
+      align-items: flex-end;
+      gap: 2px;
+      height: 12px;
+    }
+
+    .bar {
+      width: 2px;
+      background: #222;
+      border-radius: 1px;
+      min-height: 2px;
+    }
+
+    .bars.active .bar {
+      background: #c9a84c33;
+      animation: wavebar 0.9s ease-in-out infinite alternate;
+    }
+
+    .bars.active .bar:nth-child(1) { animation-duration: 0.7s; }
+    .bars.active .bar:nth-child(2) { animation-duration: 1.0s; }
+    .bars.active .bar:nth-child(3) { animation-duration: 0.6s; }
+    .bars.active .bar:nth-child(4) { animation-duration: 0.85s; }
+    .bars.active .bar:nth-child(5) { animation-duration: 0.75s; }
+
+    @keyframes wavebar {
+      from { height: 2px; }
+      to   { height: 11px; }
+    }
+  </style>
+</head>
+<body>
+
+  <div class="top">
+    <div class="eyebrow">audio effect</div>
+    <div class="title">bath<em>room</em><br>party</div>
+    <div class="year-badge">2007</div>
+  </div>
+
+  <div class="power-row">
+    <div class="power-label-group">
+      <div class="power-label">Effect</div>
+      <div class="power-sub" id="powerSub">off — tap to enter</div>
+    </div>
+    <div class="big-toggle" id="toggle"></div>
+  </div>
+
+  <div class="divider"></div>
+
+  <div class="sliders locked" id="sliders">
+
+    <div class="slider-row">
+      <div class="slider-meta">
+        <div>
+          <span class="slider-name">Depth</span>
+          <span class="slider-hint"> — how far in</span>
+        </div>
+        <div class="slider-val" id="depthVal">78%</div>
+      </div>
+      <input type="range" id="depthSlider" min="0" max="100" value="78">
+    </div>
+
+    <div class="slider-row">
+      <div class="slider-meta">
+        <div>
+          <span class="slider-name">Muffle</span>
+          <span class="slider-hint"> — wall thickness</span>
+        </div>
+        <div class="slider-val" id="muffleVal">65%</div>
+      </div>
+      <input type="range" id="muffleSlider" min="0" max="100" value="65">
+    </div>
+
+    <div class="slider-row">
+      <div class="slider-meta">
+        <div>
+          <span class="slider-name">Bass</span>
+          <span class="slider-hint"> — thump through walls</span>
+        </div>
+        <div class="slider-val" id="bassVal">65%</div>
+      </div>
+      <input type="range" id="bassSlider" min="0" max="100" value="65">
+    </div>
+
+  </div>
+
+  <div class="divider"></div>
+
+  <div class="footer">
+    <div class="status-dot" id="statusDot"></div>
+    <div class="footer-text" id="footerText">idle</div>
+    <div class="bars" id="bars">
+      <div class="bar" style="height:3px"></div>
+      <div class="bar" style="height:7px"></div>
+      <div class="bar" style="height:5px"></div>
+      <div class="bar" style="height:9px"></div>
+      <div class="bar" style="height:4px"></div>
+    </div>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
