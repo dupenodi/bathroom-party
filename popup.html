@@ -4,15 +4,16 @@
   <meta charset="utf-8">
   <title>Bathroom Party</title>
   <style>
-    @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&display=swap');
-
+    /* Self-contained: no remote fonts. Uses a geometric system stack so the
+       extension makes zero external requests and works offline. */
     * { margin: 0; padding: 0; box-sizing: border-box; }
 
     body {
       width: 300px;
       background: #0a0a08;
       color: #d4cfc4;
-      font-family: 'Space Grotesk', 'Helvetica Neue', sans-serif;
+      font-family: 'Space Grotesk', ui-sans-serif, system-ui, -apple-system,
+                   'Segoe UI', 'Helvetica Neue', Arial, sans-serif;
       overflow: hidden;
     }
 
