@@ -10,7 +10,8 @@
     "tabCapture",
     "offscreen",
     "activeTab",
-    "storage"
+    "storage",
+    "tabs"
   ],
   "action": {
     "default_popup": "popup.html",
