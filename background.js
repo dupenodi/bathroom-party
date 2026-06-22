@@ -5,24 +5,8 @@
 
 let capturedTabs = new Set(); // tabIds currently being processed
 
-function broadcastState() {
-  const tabs = [...capturedTabs];
-  chrome.runtime.sendMessage({
-    type: 'STATE_CHANGED',
-    capturedTabs: tabs,
-    activeCount: tabs.length
-  }).catch(() => {});
-  updateBadge();
-}
-
-// Toolbar badge: gold count of tabs currently in the bathroom.
-function updateBadge() {
-  const count = capturedTabs.size;
-  try {
-    chrome.action.setBadgeText({ text: count ? String(count) : '' });
-    chrome.action.setBadgeBackgroundColor({ color: '#c9a84c' });
-    chrome.action.setBadgeTextColor?.({ color: '#0a0a08' });
-  } catch (_) {}
+async function persistState() {
+  await chrome.storage.local.set({ capturedTabs: [...capturedTabs] });
 }
 
 // The offscreen doc is the source of truth — SW memory resets when it sleeps.
@@ -37,7 +21,7 @@ async function reconcileState() {
   } else {
     capturedTabs = new Set();
   }
-  updateBadge();
+  await persistState();
   return [...capturedTabs];
 }
 
@@ -74,18 +58,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     handleSessionEnded(msg.tabId).then(() => sendResponse({ success: true }));
     return true;
   }
-  if (msg.type === 'GET_LEVEL') {
-    // Popup visualizer poll — forward to the offscreen analyser.
-    forwardToOffscreen({ type: 'OFFSCREEN_GET_LEVEL', tabId: msg.tabId })
-      .then(resp => sendResponse({ level: resp?.level ?? 0 }))
-      .catch(() => sendResponse({ level: 0 }));
-    return true;
-  }
 });
 
-// Always attempt cleanup — capturedTabs may be empty if the SW slept.
+// A captured tab being closed should free its session.
 chrome.tabs.onRemoved.addListener((tabId) => {
-  stopCapture(tabId);
+  if (capturedTabs.has(tabId)) stopCapture(tabId);
 });
 
 async function offscreenExists() {
@@ -100,18 +77,8 @@ async function ensureOffscreen() {
     reasons: ['USER_MEDIA'],
     justification: 'Bathroom reverb audio processing'
   });
-  await waitForOffscreenReady();
-}
-
-async function waitForOffscreenReady(maxMs = 500) {
-  const deadline = Date.now() + maxMs;
-  while (Date.now() < deadline) {
-    try {
-      const resp = await chrome.runtime.sendMessage({ type: 'OFFSCREEN_QUERY' });
-      if (resp?.tabs !== undefined) return;
-    } catch (_) {}
-    await new Promise(r => setTimeout(r, 40));
-  }
+  // Give it a moment to boot before we message it
+  await new Promise(r => setTimeout(r, 80));
 }
 
 async function destroyOffscreen() {
@@ -150,16 +117,15 @@ async function startCapture(tabId, settings) {
     });
 
     if (response?.success) {
-      await reconcileState();
-      broadcastState();
+      capturedTabs.add(tabId);
+      await persistState();
       return { success: true, activeCount: capturedTabs.size };
     }
 
-    await reconcileState();
+    // Failed to start this tab; only tear down if nothing else is running.
     if (capturedTabs.size === 0) await destroyOffscreen();
     return { success: false, error: response?.error || 'Audio processor failed to start' };
   } catch (err) {
-    await reconcileState();
     if (capturedTabs.size === 0) await destroyOffscreen();
     return { success: false, error: err.message };
   }
@@ -170,19 +136,20 @@ async function stopCapture(tabId) {
     if (await offscreenExists()) {
       try { await forwardToOffscreen({ type: 'OFFSCREEN_STOP', tabId }); } catch (_) {}
     }
-    await reconcileState();
+    capturedTabs.delete(tabId);
 
+    // Free the offscreen document once the last tab stops.
     if (capturedTabs.size === 0) await destroyOffscreen();
 
-    broadcastState();
+    await persistState();
     return { success: true, activeCount: capturedTabs.size };
   } catch (err) {
     return { success: false, error: err.message };
   }
 }
 
-async function handleSessionEnded(_tabId) {
-  await reconcileState();
+async function handleSessionEnded(tabId) {
+  capturedTabs.delete(tabId);
   if (capturedTabs.size === 0) await destroyOffscreen();
-  broadcastState();
+  await persistState();
 }
