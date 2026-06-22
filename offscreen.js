@@ -10,7 +10,9 @@ const sessions = new Map(); // tabId -> session object
 let currentSettings = {
   depth:  0.78,
   bass:   0.65,
-  muffle: 0.65
+  muffle: 0.65,
+  room:   0.45,
+  preset: 'bathroom'
 };
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
@@ -40,13 +42,22 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     sendResponse({ tabs: [...sessions.keys()] });
     return true;
   }
+  if (msg.type === 'OFFSCREEN_GET_LEVEL') {
+    // Cheap output-loudness read for the popup visualizer (0..1).
+    sendResponse({ level: readLevel(msg.tabId) });
+    return true;
+  }
 });
 
 async function startProcessing(tabId, streamId, settings) {
   // Replace any existing session for this tab (re-toggle / restart)
   await stopProcessing(tabId, true);
 
-  if (settings) currentSettings = { ...currentSettings, ...settings };
+  // Only adopt popup settings when this is the first session — otherwise a
+  // second tab starting (or a storage race) would overwrite live globals.
+  if (settings && sessions.size === 0) {
+    currentSettings = { ...currentSettings, ...settings };
+  }
 
   const mediaStream = await navigator.mediaDevices.getUserMedia({
     audio: {
@@ -67,8 +78,6 @@ async function startProcessing(tabId, streamId, settings) {
     ? new AudioContext({ sampleRate: nativeRate, latencyHint: 'playback' })
     : new AudioContext({ latencyHint: 'playback' });
 
-  if (audioCtx.state === 'suspended') await audioCtx.resume();
-
   const session = { tabId, audioCtx, mediaStream, stopTimer: null };
   session.sourceNode = audioCtx.createMediaStreamSource(mediaStream);
 
@@ -77,6 +86,15 @@ async function startProcessing(tabId, streamId, settings) {
 
   sessions.set(tabId, session);
 
+  // Resume AFTER the graph is wired. The context can boot suspended; retry and
+  // also recover if Chrome suspends it later. This is what removes the old
+  // "play audio first, then enable" requirement — capture now works even on a
+  // tab that hasn't started playing yet.
+  await ensureRunning(audioCtx);
+  audioCtx.addEventListener('statechange', () => {
+    if (audioCtx.state === 'suspended') ensureRunning(audioCtx);
+  });
+
   // When the tab is closed or navigates away, its capture track ends.
   // Tear down that session and let the background reconcile its state.
   track.addEventListener('ended', () => {
@@ -84,6 +102,29 @@ async function startProcessing(tabId, streamId, settings) {
       try { chrome.runtime.sendMessage({ type: 'SESSION_ENDED', tabId }); } catch (_) {}
     });
   });
+}
+
+// Best-effort resume loop. Never throws — a suspended context is recoverable
+// and we'd rather keep the session alive than fail the whole capture.
+async function ensureRunning(ctx, attempts = 6) {
+  for (let i = 0; i < attempts; i++) {
+    if (ctx.state === 'running' || ctx.state === 'closed') return;
+    try { await ctx.resume(); } catch (_) {}
+    if (ctx.state === 'running') return;
+    await new Promise(r => setTimeout(r, 70));
+  }
+}
+
+// Output loudness (0..1) for the popup's live bars. Pulls from the per-tab
+// analyser; returns 0 when there's no session or no signal.
+function readLevel(tabId) {
+  const s = sessions.get(tabId);
+  if (!s || !s.analyserNode) return 0;
+  const buf = s._levelBuf || (s._levelBuf = new Uint8Array(s.analyserNode.frequencyBinCount));
+  s.analyserNode.getByteFrequencyData(buf);
+  let sum = 0;
+  for (let i = 0; i < buf.length; i++) sum += buf[i];
+  return Math.min(1, (sum / buf.length) / 180);
 }
 
 function buildDSPChain(s) {
@@ -125,7 +166,8 @@ function buildDSPChain(s) {
 
   // ── Reverb ───────────────────────────────────────────────────────────
   s.convolverNode = ctx.createConvolver();
-  s.convolverNode.buffer = generateBathroomIR(ctx);
+  s.convolverNode.buffer = getIR(ctx, currentSettings.room);
+  s.currentRoomBucket = roomBucket(currentSettings.room);
 
   // ── Gain nodes ───────────────────────────────────────────────────────
   s.wetGainNode  = ctx.createGain();
@@ -154,6 +196,11 @@ function buildDSPChain(s) {
   s.limiterNode.ratio.value     = 16;
   s.limiterNode.attack.value    =  0.002;
   s.limiterNode.release.value   =  0.09;
+
+  // Analyser taps the final output — drives the popup's live level bars.
+  s.analyserNode = ctx.createAnalyser();
+  s.analyserNode.fftSize = 256;
+  s.analyserNode.smoothingTimeConstant = 0.6;
 
   // ── Routing ──────────────────────────────────────────────────────────
   //
@@ -185,8 +232,10 @@ function buildDSPChain(s) {
   s.bassPassNode.connect(s.bassGainNode);
   s.bassGainNode.connect(s.softClipNode);
 
-  s.softClipNode.connect(s.limiterNode);
   s.limiterNode.connect(ctx.destination);
+  s.limiterNode.connect(s.analyserNode);
+
+  buildLofiChain(s);
 }
 
 function applySettings(s) {
@@ -228,6 +277,147 @@ function applySettings(s) {
   // ── Master makeup gain ──────────────────────────────────────────────
   const makeup = 1.35 + d * 0.45;
   s.masterGainNode.gain.setTargetAtTime(makeup, t, tau);
+
+  // ── Room size — swap the convolver IR when the bucket changes ───────
+  // (Bucketed + cached so live dragging doesn't rebuild a buffer per frame.)
+  const rb = roomBucket(currentSettings.room);
+  if (rb !== s.currentRoomBucket && s.convolverNode) {
+    s.convolverNode.buffer = getIR(s.audioCtx, currentSettings.room);
+    s.currentRoomBucket = rb;
+  }
+
+  setLofiEnabled(s, currentSettings.preset === 'lofi');
+}
+
+// ── Lo-fi chain (preset-only) ─────────────────────────────────────────
+// Sits after the main bathroom DSP: wow/flutter → bit crush → tape sat,
+// plus a parallel vinyl-hiss bed. Toggled via settings.preset === 'lofi'.
+
+function buildLofiChain(s) {
+  const ctx = s.audioCtx;
+
+  s.lofiDryGain = ctx.createGain();
+  s.lofiDryGain.gain.value = 1;
+
+  s.lofiWetGain = ctx.createGain();
+  s.lofiWetGain.gain.value = 0;
+
+  // Wow / flutter — short delay, pitch wobble via scheduled delayTime
+  s.wowDelay = ctx.createDelay(0.05);
+  s.wowDelay.delayTime.value = 0.011;
+  s.wowMixDry = ctx.createGain();
+  s.wowMixDry.gain.value = 0.7;
+  s.wowMixWet = ctx.createGain();
+  s.wowMixWet.gain.value = 0.5;
+
+  s.wowBus = ctx.createGain();
+
+  s.lofiCrushNode = ctx.createWaveShaper();
+  s.lofiCrushNode.curve = makeBitCrushCurve(7);
+  s.lofiCrushNode.oversample = 'none';
+
+  s.lofiTapeNode = ctx.createWaveShaper();
+  s.lofiTapeNode.curve = makeSoftClipCurve(3.6);
+  s.lofiTapeNode.oversample = '2x';
+
+  // Vinyl hiss + sparse crackle, looped quietly under the mix
+  s.hissSource = createHissSource(ctx);
+  s.hissHP = ctx.createBiquadFilter();
+  s.hissHP.type = 'highpass';
+  s.hissHP.frequency.value = 400;
+  s.hissLP = ctx.createBiquadFilter();
+  s.hissLP.type = 'lowpass';
+  s.hissLP.frequency.value = 6800;
+  s.hissGain = ctx.createGain();
+  s.hissGain.gain.value = 0;
+
+  // Wet FX input — muted unless lo-fi preset is active (keeps dry path clean)
+  s.lofiFxInput = ctx.createGain();
+  s.lofiFxInput.gain.value = 0;
+
+  s.softClipNode.connect(s.lofiDryGain);
+  s.lofiDryGain.connect(s.limiterNode);
+
+  s.softClipNode.connect(s.lofiFxInput);
+  s.lofiFxInput.connect(s.wowDelay);
+  s.lofiFxInput.connect(s.wowMixDry);
+  s.wowDelay.connect(s.wowMixWet);
+  s.wowMixDry.connect(s.wowBus);
+  s.wowMixWet.connect(s.wowBus);
+  s.wowBus.connect(s.lofiCrushNode);
+  s.lofiCrushNode.connect(s.lofiTapeNode);
+  s.lofiTapeNode.connect(s.lofiWetGain);
+  s.lofiWetGain.connect(s.limiterNode);
+
+  s.hissSource.connect(s.hissHP);
+  s.hissHP.connect(s.hissLP);
+  s.hissLP.connect(s.hissGain);
+  s.hissGain.connect(s.limiterNode);
+
+  s.hissSource.start(0);
+}
+
+function startWowFlutter(s) {
+  stopWowFlutter(s);
+  const ctx = s.audioCtx;
+  const base = 0.011;
+  const depth = 0.003;
+  const rate = 0.48;
+  s.wowPhase = 0;
+  s.wowTimer = setInterval(() => {
+    if (!s.wowDelay || ctx.state === 'closed') return;
+    s.wowPhase += 0.1;
+    const dt = base + depth * Math.sin(2 * Math.PI * rate * s.wowPhase);
+    try {
+      s.wowDelay.delayTime.setTargetAtTime(dt, ctx.currentTime, 0.05);
+    } catch (_) {}
+  }, 100);
+}
+
+function stopWowFlutter(s) {
+  if (s.wowTimer) {
+    clearInterval(s.wowTimer);
+    s.wowTimer = null;
+  }
+}
+
+function setLofiEnabled(s, enabled) {
+  if (!s.lofiDryGain) return;
+  const t = s.audioCtx.currentTime;
+  const tau = 0.05;
+  s.lofiDryGain.gain.setTargetAtTime(enabled ? 0 : 1, t, tau);
+  s.lofiWetGain.gain.setTargetAtTime(enabled ? 1 : 0, t, tau);
+  s.lofiFxInput.gain.setTargetAtTime(enabled ? 1 : 0, t, tau);
+  s.hissGain.gain.setTargetAtTime(enabled ? 0.026 : 0, t, tau);
+  if (enabled) startWowFlutter(s);
+  else stopWowFlutter(s);
+}
+
+function createHissSource(ctx) {
+  const len = ctx.sampleRate * 2;
+  const buf = ctx.createBuffer(1, len, ctx.sampleRate);
+  const data = buf.getChannelData(0);
+  const rand = mulberry32(0xdecafbad);
+  for (let i = 0; i < len; i++) {
+    let v = (rand() * 2 - 1) * 0.35;
+    if (rand() < 0.00012) v += (rand() * 2 - 1) * 2.5;
+    data[i] = v;
+  }
+  const src = ctx.createBufferSource();
+  src.buffer = buf;
+  src.loop = true;
+  return src;
+}
+
+function makeBitCrushCurve(bits) {
+  const steps = Math.pow(2, bits);
+  const samples = 256;
+  const curve = new Float32Array(samples);
+  for (let i = 0; i < samples; i++) {
+    const x = (i * 2) / (samples - 1) - 1;
+    curve[i] = Math.round(x * steps) / steps;
+  }
+  return curve;
 }
 
 function makeSoftClipCurve(drive) {
@@ -266,19 +456,55 @@ async function stopProcessing(tabId, immediate = false) {
 }
 
 function teardownSession(s) {
+  stopWowFlutter(s);
   try { if (s.sourceNode) s.sourceNode.disconnect(); } catch (_) {}
   try { if (s.mediaStream) s.mediaStream.getTracks().forEach(t => t.stop()); } catch (_) {}
   try { if (s.audioCtx && s.audioCtx.state !== 'closed') s.audioCtx.close(); } catch (_) {}
 }
 
-// ── Bathroom IR generator ──────────────────────────────────────────────
-// Models a small tiled room (~2.5m²): dense early reflections at 6–15ms,
-// bright initial decay, rapid high-frequency absorption, ~1.1s total decay
-function generateBathroomIR(ctx) {
+// ── Room IR generator ──────────────────────────────────────────────────
+// Builds a synthetic room impulse response. `room` (0..1) scales the space:
+//   0 → small tight tiled bathroom (short, fast decay)
+//   1 → large reverberant hall (long, slow decay)
+// The noise is seeded so the room sounds identical every session, and results
+// are cached per (sampleRate, roomBucket) so live dragging is cheap.
+
+const irCache = new Map();
+
+function roomBucket(room) {
+  const r = Math.max(0, Math.min(1, room ?? 0.45));
+  return Math.round(r * 10) / 10; // quantize to 0.1 steps for caching
+}
+
+function getIR(ctx, room) {
+  const rb  = roomBucket(room);
+  const key = `${ctx.sampleRate}:${rb}`;
+  let buf = irCache.get(key);
+  if (!buf) {
+    buf = generateRoomIR(ctx, rb);
+    irCache.set(key, buf);
+  }
+  return buf;
+}
+
+// Small deterministic PRNG (mulberry32) so the reverb is reproducible.
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return function () {
+    a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function generateRoomIR(ctx, room) {
   const sr     = ctx.sampleRate;
-  const dur    = 1.1;             // longer tail for a more obvious room
+  const dur    = 0.5 + room * 2.1;     // 0.5s (small) … 2.6s (hall)
+  const decayK = 9.5 - room * 7.5;     // faster decay for smaller rooms
   const length = Math.floor(sr * dur);
   const ir     = ctx.createBuffer(2, length, sr);
+  const rand   = mulberry32(0x9e3779b1);
 
   for (let ch = 0; ch < 2; ch++) {
     const data = ir.getChannelData(ch);
@@ -286,40 +512,37 @@ function generateBathroomIR(ctx) {
     for (let i = 0; i < length; i++) {
       const t = i / sr;
 
-      // White noise base
-      let s = Math.random() * 2 - 1;
+      // Seeded noise base
+      let s = rand() * 2 - 1;
 
-      // Early reflections: dense cluster 6–18ms (tile walls close together)
+      // Early reflections: dense cluster (close walls)
       const er = t < 0.022
         ? Math.exp(-t * 120) * 2.8
         : 0;
 
-      // Main exponential decay — tuned for a ~1.1s RT60
-      const decay = Math.exp(-t * 6.2);
+      // Main exponential decay — RT60 scales with room size
+      const decay = Math.exp(-t * decayK);
 
-      // High-frequency air absorption: tiles reflect highs but air absorbs them
+      // High-frequency air absorption: tail gets duller over time
       const hfDamp = t > 0.05
         ? Math.pow(0.5, t * 5.5)
         : 1.0;
 
-      // Combine: early reflections bright, tail increasingly dull
       const hfComponent = s * decay * hfDamp;
       const lfComponent = s * decay;
       s = hfComponent * 0.35 + lfComponent * 0.65;
 
       // Short fade-in prevents a click when convolution starts
       const fadeIn = Math.min(1, i / (sr * 0.004));
-      data[i] = (s + er * (Math.random() * 2 - 1)) * 0.36 * fadeIn;
+      data[i] = (s + er * (rand() * 2 - 1)) * 0.36 * fadeIn;
     }
 
     // Right channel: slight delay (~0.7ms = 30 samples) for stereo width
-    // Simulates slightly different path lengths to left/right ear in a room
     if (ch === 1) {
       const delay = 30;
       for (let i = length - 1; i >= delay; i--) {
         data[i] = data[i] * 0.8 + data[i - delay] * 0.2;
       }
-      // Also slightly attenuate to simulate asymmetric room shape
       for (let i = 0; i < length; i++) data[i] *= 0.88;
     }
   }
