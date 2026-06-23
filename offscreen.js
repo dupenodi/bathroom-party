@@ -97,7 +97,6 @@ async function startProcessing(tabId, streamId, settings) {
   } catch (e) {
     mediaStream.getTracks().forEach(tr => tr.stop());
     await audioCtx.close().catch(() => {});
-    workletReady = null;
     throw new Error(e?.message || 'audio processor failed to load');
   }
 
