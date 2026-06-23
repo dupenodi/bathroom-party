@@ -1,10 +1,7 @@
 .DS_Store
 *.zip
 node_modules/
-
-# Icon source assets (canonical icons are icon16/48/128.png)
-bathroom-party-original.jpg
-bathroom-128.png
-bathroom-party-16.png
-bathroom-party-48.png
 .cursor/
+
+# generated marketing master (regenerate via scripts/generate-icons.py)
+icon-source-512.png
