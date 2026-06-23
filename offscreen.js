@@ -1,54 +1,105 @@
+const WOW_DELAY_MAX = 0.04;
+const HALL_PRE_DELAY_MAX = 0.14;
+
 const sessions = new Map();
+// Track which AudioContexts have had the worklet module loaded.
+// A singleton promise breaks when the AudioContext is closed and recreated —
+// the old resolved promise prevents addModule being called on the new context.
+const workletContexts = new WeakSet();
 
 let currentSettings = {
   preset: DEFAULT_PRESET_ID,
-  depth: 0.5,
-  muffle: 0.5,
-  bass: 0.5
+  depth: 0.55,
+  muffle: 0.60,
+  bass: 0.60
 };
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
-  if (msg.type === 'OFFSCREEN_START') {
-    startProcessing(msg.tabId, msg.streamId, msg.settings)
-      .then(() => sendResponse({ success: true }))
-      .catch(e => sendResponse({ success: false, error: e.message }));
-    return true;
-  }
-  if (msg.type === 'OFFSCREEN_STOP') {
-    stopProcessing(msg.tabId).then(() => sendResponse({ success: true }));
-    return true;
-  }
-  if (msg.type === 'OFFSCREEN_UPDATE_SETTINGS') {
-    if (msg.settings) {
-      currentSettings = { ...currentSettings, ...msg.settings };
-      for (const session of sessions.values()) syncSession(session);
+  const reply = (payload) => {
+    try { sendResponse(payload); } catch (_) {}
+  };
+
+  try {
+    if (msg.type === 'OFFSCREEN_START') {
+      startProcessing(msg.tabId, msg.streamId, msg.settings)
+        .then(() => reply({ success: true }))
+        .catch(e => reply({ success: false, error: e?.message || 'start failed' }));
+      return true;
     }
-    sendResponse({ success: true });
-    return true;
-  }
-  if (msg.type === 'OFFSCREEN_QUERY') {
-    sendResponse({ tabs: [...sessions.keys()] });
-    return true;
-  }
-  if (msg.type === 'OFFSCREEN_GET_LEVEL') {
-    sendResponse(readMeter(msg.tabId));
+    if (msg.type === 'OFFSCREEN_STOP') {
+      stopProcessing(msg.tabId)
+        .then(() => reply({ success: true }))
+        .catch(e => reply({ success: false, error: e?.message || 'stop failed' }));
+      return true;
+    }
+    if (msg.type === 'OFFSCREEN_UPDATE_SETTINGS') {
+      if (msg.settings) {
+        currentSettings = { ...currentSettings, ...msg.settings };
+        for (const session of sessions.values()) syncSession(session);
+      }
+      reply({ success: true });
+      return true;
+    }
+    if (msg.type === 'OFFSCREEN_QUERY') {
+      reply({ tabs: [...sessions.keys()] });
+      return true;
+    }
+    if (msg.type === 'OFFSCREEN_GET_LEVEL') {
+      reply(readMeter(msg.tabId));
+      return true;
+    }
+  } catch (e) {
+    reply({ success: false, error: e?.message || 'offscreen handler error' });
     return true;
   }
 });
 
+async function ensureWorklet(ctx) {
+  if (!workletContexts.has(ctx)) {
+    await ctx.audioWorklet.addModule(chrome.runtime.getURL('pitch-processor.js'));
+    workletContexts.add(ctx);
+  }
+}
+
 async function startProcessing(tabId, streamId, settings) {
+  if (tabId == null || !streamId) throw new Error('invalid capture request');
+
   await stopProcessing(tabId, true);
   if (settings) currentSettings = { ...currentSettings, ...settings };
 
-  const mediaStream = await navigator.mediaDevices.getUserMedia({
-    audio: { mandatory: { chromeMediaSource: 'tab', chromeMediaSourceId: streamId } }, video: false
-  });
+  let mediaStream;
+  try {
+    mediaStream = await navigator.mediaDevices.getUserMedia({
+      audio: { mandatory: { chromeMediaSource: 'tab', chromeMediaSourceId: streamId } }, video: false
+    });
+  } catch (e) {
+    const raw = e?.message || '';
+    if (raw.includes('Invalid state') || raw.includes('invalid state'))
+      throw new Error('stream expired — toggle off and on');
+    if (raw.includes('Error starting capture') || raw.includes('Could not start'))
+      throw new Error('no tab audio — start playback first');
+    throw new Error(raw || 'could not open tab audio');
+  }
 
   const track = mediaStream.getAudioTracks()[0];
-  const nativeRate = track?.getSettings?.().sampleRate;
+  if (!track) {
+    mediaStream.getTracks().forEach(tr => tr.stop());
+    throw new Error('no audio track in tab stream');
+  }
+
+  const nativeRate = track.getSettings?.().sampleRate;
   const audioCtx = nativeRate
     ? new AudioContext({ sampleRate: nativeRate, latencyHint: 'playback' })
     : new AudioContext({ latencyHint: 'playback' });
+
+  try {
+    await ensureWorklet(audioCtx);
+  } catch (e) {
+    mediaStream.getTracks().forEach(tr => tr.stop());
+    await audioCtx.close().catch(() => {});
+    workletReady = null;
+    throw new Error(e?.message || 'audio processor failed to load');
+  }
 
   const session = { tabId, audioCtx, mediaStream, nodes: [] };
   session.sourceNode = audioCtx.createMediaStreamSource(mediaStream);
@@ -85,7 +136,10 @@ async function ensureRunning(ctx, attempts = 6) {
 }
 
 function buildEngine(s) {
+  stopWow(s);
   try { s.sourceNode?.disconnect(); } catch (_) {}
+  try { s.inputTrim?.disconnect(); } catch (_) {}
+  try { s.fadeGain?.disconnect(); } catch (_) {}
   s.nodes = [];
 
   const presetId = currentSettings.preset ?? DEFAULT_PRESET_ID;
@@ -96,11 +150,11 @@ function buildEngine(s) {
   s.inputTrim = gain(ctx, 1);
   s.fadeGain = gain(ctx, 1);
   s.limiter = ctx.createDynamicsCompressor();
-  s.limiter.threshold.value = -9;
-  s.limiter.knee.value = 8;
-  s.limiter.ratio.value = 4;
-  s.limiter.attack.value = 0.006;
-  s.limiter.release.value = 0.14;
+  s.limiter.threshold.value = -6;
+  s.limiter.knee.value = 10;
+  s.limiter.ratio.value = 3;
+  s.limiter.attack.value = 0.005;
+  s.limiter.release.value = 0.12;
   s.analyser = ctx.createAnalyser();
   s.analyser.fftSize = 512;
   s.analyser.smoothingTimeConstant = 0.35;
@@ -109,113 +163,150 @@ function buildEngine(s) {
   s.limiter.connect(ctx.destination);
   s.limiter.connect(s.analyser);
 
-  if (s.family === 'hall') buildHallEngine(s);
+  if (s.family === 'nightcore') buildNightcoreEngine(s);
+  else if (s.family === 'hall') buildHallEngine(s);
   else if (s.family === 'lofi') buildLofiEngine(s);
-  else buildPartyEngine(s);
+  else buildBathroomEngine(s);
 
   s.sourceNode.connect(s.inputTrim);
 }
 
-// ── Party: through-the-wall crossover (muffled body + tile reverb + bass thump) ──
-function buildPartyEngine(s) {
+function makePitchNode(ctx, pitch) {
+  return new AudioWorkletNode(ctx, 'pitch-processor', {
+    numberOfInputs: 1,
+    numberOfOutputs: 1,
+    outputChannelCount: [2],
+    parameterData: { pitch: clamp(pitch, 0.5, 2.0) }
+  });
+}
+
+// ─────────────────────────────────────────────────
+// BATHROOM — through-the-wall room reverb
+//
+// Signal path:
+//   bass (LP 130Hz)                              → bassGain → mix
+//   mids/highs (HP 130Hz) → wallLP (muffle) → bodyGain → mix
+//   full → preDelay → conv (bathroom IR) → revLP → wetGain → mix
+// ─────────────────────────────────────────────────
+function buildBathroomEngine(s) {
   const ctx = s.audioCtx;
-  const profile = PRESET_DSP.party;
 
-  s.bassSplit = filter(ctx, 'lowpass', 165, 0.55);
-  s.bodySplit = filter(ctx, 'highpass', 165, 0.55);
-  s.wallLP = filter(ctx, 'lowpass', 1400, 0.7);
-  s.vocalDip = filter(ctx, 'peaking', 2600, 0.9);
-  s.vocalDip.gain.value = -4;
-  s.reverbHP = filter(ctx, 'highpass', 220, 0.5);
-  s.reverbLP = filter(ctx, 'lowpass', 4200, 0.5);
-
-  s.convolver = ctx.createConvolver();
-  s.convolver.normalize = true;
-  s.convolver.buffer = buildPartyIR(ctx, profile);
-
-  s.bodyGain = gain(ctx);
-  s.wetGain = gain(ctx);
+  // bass split — lows travel through walls with little attenuation
+  s.bassLP = filter(ctx, 'lowpass', 130, 0.6);
   s.bassGain = gain(ctx);
-  s.mixGain = gain(ctx);
 
-  wire(s.inputTrim, s.bassSplit, s.bassGain, s.mixGain);
-  wire(s.inputTrim, s.bodySplit, s.wallLP, s.vocalDip, s.bodyGain, s.mixGain);
-  wire(s.vocalDip, s.reverbHP, s.convolver, s.reverbLP, s.wetGain, s.mixGain);
+  // mid/hi body — goes through a wall LP (muffle control)
+  s.bodyHP = filter(ctx, 'highpass', 130, 0.6);
+  s.wallLP = filter(ctx, 'lowpass', 3500, 0.55);
+  s.bodyGain = gain(ctx);
+
+  // reverb — full range into pre-delay then convolver
+  s.revPreDelay = ctx.createDelay(0.06);
+  s.revPreDelay.delayTime.value = 0.015;
+  s.convolver = ctx.createConvolver();
+  s.convolver.normalize = false;
+  s.convolver.buffer = buildBathroomIR(ctx);
+  s.revLP = filter(ctx, 'lowpass', 6000, 0.5);
+  s.wetGain = gain(ctx);
+
+  s.mixGain = gain(ctx, 1);
+
+  wire(s.inputTrim, s.bassLP, s.bassGain, s.mixGain);
+  wire(s.inputTrim, s.bodyHP, s.wallLP, s.bodyGain, s.mixGain);
+  wire(s.inputTrim, s.revPreDelay, s.convolver, s.revLP, s.wetGain, s.mixGain);
   wire(s.mixGain, s.fadeGain);
 }
 
-// ── Hall: ambience engine — pre-delay + Schroeder combs + long IR (no wall muffling) ──
+// ─────────────────────────────────────────────────
+// HALL — large reverberant space
+//
+// Signal path:
+//   dry → dryGain → mix
+//   → preDelay → hallHP → 4 Schroeder combs → combBus → dampLP → earlyGain → mix
+//   → preDelay → hallHP → conv (long hall IR) → convWet → mix
+// ─────────────────────────────────────────────────
 function buildHallEngine(s) {
   const ctx = s.audioCtx;
   const sr = ctx.sampleRate;
   const scale = sr / 44100;
 
   s.dryGain = gain(ctx);
-  s.wetGain = gain(ctx);
   s.mixGain = gain(ctx);
 
-  s.preDelay = ctx.createDelay(0.25);
-  s.preDelay.delayTime.value = 0.07;
+  s.preDelayMax = HALL_PRE_DELAY_MAX;
+  s.preDelay = ctx.createDelay(HALL_PRE_DELAY_MAX);
+  s.preDelay.delayTime.value = 0.072;
 
-  s.hallHP = filter(ctx, 'highpass', 140, 0.5);
-  s.hallDamp = filter(ctx, 'lowpass', 5000, 0.5);
+  s.hallHP = filter(ctx, 'highpass', 80, 0.5);
+  s.dampLP = filter(ctx, 'lowpass', 5000, 0.5);
+  s.earlyGain = gain(ctx);
 
   s.combBus = gain(ctx);
-  const combTimes = [0.0297, 0.0371, 0.0411, 0.0437];
+  const combTimes = [0.0297, 0.0371, 0.0417, 0.0443, 0.0517, 0.0561];
   s._combInputs = [];
   for (const base of combTimes) {
-    const comb = makeComb(ctx, base * scale, 0.74, 3200);
+    const comb = makeComb(ctx, base * scale, 0.76, 3600);
     comb.output.connect(s.combBus);
     s._combInputs.push(comb.input);
   }
 
   s.hallConv = ctx.createConvolver();
-  s.hallConv.normalize = true;
+  s.hallConv.normalize = false;
   s.hallConv.buffer = buildHallIR(ctx);
   s.convWet = gain(ctx);
 
   wire(s.inputTrim, s.dryGain, s.mixGain);
   wire(s.inputTrim, s.preDelay, s.hallHP);
+  wire(s.combBus, s.dampLP, s.earlyGain, s.mixGain);
   wire(s.hallHP, s.hallConv, s.convWet, s.mixGain);
-  wire(s.combBus, s.hallDamp, s.wetGain, s.mixGain);
   wire(s.mixGain, s.fadeGain);
-  for (const input of s._combInputs) s.hallHP.connect(input);
+  for (const inp of s._combInputs) s.hallHP.connect(inp);
 }
 
-// ── Lo-fi: tape degradation (wow, crush, hiss) + tiny room — not a wall effect ──
+// ─────────────────────────────────────────────────
+// LO-FI — degraded tape / vinyl
+//
+// Signal path:
+//   → hipassHP (remove sub rumble)
+//   → warmLP (roll off highs like tape)
+//   → tapeWarm (mid warmth bump)
+//   → wowDelay (flutter) + wowDry → wowBus
+//   → crush (bit reduction) → lofiGain → mix
+//   hiss → hissHP → hissGain → mix
+// ─────────────────────────────────────────────────
 function buildLofiEngine(s) {
   const ctx = s.audioCtx;
   const profile = PRESET_DSP.lofi;
 
-  s.lofiLP = filter(ctx, 'lowpass', 3200, 0.6);
-  s.lofiBody = gain(ctx);
+  s.hipassHP = filter(ctx, 'highpass', 80, 0.6);
+  s.warmLP = filter(ctx, 'lowpass', 3500, 0.55);
+  s.tapeWarm = filter(ctx, 'peaking', 380, 0.6);
+  s.tapeWarm.gain.value = 3;
 
-  s.lofiConv = ctx.createConvolver();
-  s.lofiConv.normalize = true;
-  s.lofiConv.buffer = buildLofiIR(ctx, profile);
-  s.lofiWet = gain(ctx);
-
-  s.wowDelay = ctx.createDelay(0.04);
-  s.wowDelay.delayTime.value = 0.009;
-  s.wowDry = gain(ctx, 0.65);
-  s.wowWet = gain(ctx, 0.45);
+  s.wowDelayMax = WOW_DELAY_MAX;
+  s.wowDelay = ctx.createDelay(WOW_DELAY_MAX);
+  s.wowDelay.delayTime.value = 0.008;
+  s.wowDry = gain(ctx, 0.6);
+  s.wowWet = gain(ctx, 0.5);
   s.wowBus = gain(ctx);
 
   s.crush = ctx.createWaveShaper();
   s.crush.curve = makeCrushCurve(profile.crushBits);
   s.crush.oversample = '2x';
 
-  s.hiss = makeHiss(ctx, profile.seed);
-  s.hissHP = filter(ctx, 'highpass', 2800, 0.7);
-  s.hissGain = gain(ctx, profile.hiss);
-
+  s.lofiGain = gain(ctx);
   s.mixGain = gain(ctx);
 
-  wire(s.inputTrim, s.lofiLP, s.lofiBody, s.mixGain);
-  wire(s.lofiLP, s.lofiConv, s.lofiWet, s.mixGain);
-  wire(s.lofiLP, s.wowDelay, s.wowWet, s.wowBus);
-  wire(s.lofiLP, s.wowDry, s.wowBus);
-  wire(s.wowBus, s.crush, s.mixGain);
+  s.hiss = makeHiss(ctx, profile.seed);
+  s.hissHP = filter(ctx, 'highpass', 3200, 0.7);
+  s.hissGain = gain(ctx, profile.hiss);
+
+  wire(s.inputTrim, s.hipassHP, s.warmLP, s.tapeWarm);
+  s.tapeWarm.connect(s.wowDelay);
+  s.tapeWarm.connect(s.wowDry);
+  wire(s.wowDelay, s.wowWet, s.wowBus);
+  wire(s.wowDry, s.wowBus);
+  wire(s.wowBus, s.crush, s.lofiGain, s.mixGain);
   wire(s.hiss, s.hissHP, s.hissGain, s.mixGain);
   wire(s.mixGain, s.fadeGain);
 
@@ -223,6 +314,26 @@ function buildLofiEngine(s) {
   startWow(s);
 }
 
+// ─────────────────────────────────────────────────
+// NIGHTCORE — pitch shift only (tempo unchanged), bright anime EQ
+// Uses OLA pitch processor: voices sound higher, song speed stays the same
+// ─────────────────────────────────────────────────
+function buildNightcoreEngine(s) {
+  const ctx = s.audioCtx;
+  const profile = PRESET_DSP[s.presetId] ?? PRESET_DSP.nightcore;
+
+  s.pitchNode = makePitchNode(ctx, profile.baseRate);
+  s.ncBright  = filter(ctx, 'highshelf', profile.brightHz, 0.7);
+  s.ncBright.gain.value = 0;
+  s.ncBody = gain(ctx);
+  s.ncMix  = gain(ctx);
+
+  wire(s.inputTrim, s.pitchNode, s.ncBright, s.ncBody, s.ncMix, s.fadeGain);
+}
+
+// ─────────────────────────────────────────────────
+// SETTINGS APPLICATION
+// ─────────────────────────────────────────────────
 function applyEngineSettings(s) {
   if (!s?.audioCtx) return;
   const t = s.audioCtx.currentTime;
@@ -231,69 +342,90 @@ function applyEngineSettings(s) {
   const presetId = presetIn ?? s.presetId ?? DEFAULT_PRESET_ID;
   s.presetId = presetId;
 
-  const rawD = clamp01(depth);
-  const rawM = clamp01(muffle);
-  const rawB = clamp01(bass);
+  const d = clamp01(depth);
+  const m = clamp01(muffle);
+  const b = clamp01(bass);
 
-  if (s.family === 'party') {
-    const d = Math.pow(partyDrive(rawD), 0.55);
-    const m = Math.pow(partyDrive(rawM), 0.35);
-    const b = Math.pow(partyDrive(rawB), 0.45);
-    applyPartySettings(s, t, tau, d, m, b);
-  } else {
-    const d = Math.pow(rawD, 0.75);
-    const m = Math.pow(rawM, 0.4);
-    const b = Math.pow(rawB, 0.55);
-    if (s.family === 'hall') applyHallSettings(s, t, tau, d, m, b, presetId);
-    else applyLofiSettings(s, t, tau, d, m, b, presetId);
-  }
+  if (s.family === 'party') applyBathroomSettings(s, t, tau, d, m, b);
+  else if (s.family === 'hall') applyHallSettings(s, t, tau, d, m, b);
+  else if (s.family === 'lofi') applyLofiSettings(s, t, tau, d, m, b);
+  else if (s.family === 'nightcore') applyNightcoreSettings(s, t, tau, d, m, b);
 }
 
-// 50% slider = reference intensity; 100% = stronger headroom above reference
-function partyDrive(slider01) {
-  const t = clamp01(slider01);
-  if (t <= 0.5) return t * 2;
-  return 1 + (t - 0.5) * 0.8;
-}
+function applyBathroomSettings(s, t, tau, d, m, b) {
+  // wallLP cutoff: muffle=0 → 4000Hz (thin wall), muffle=1 → 300Hz (thick concrete)
+  const wallHz = 4000 - m * 3700;
+  setFreq(s.wallLP, wallHz, t, tau, s.audioCtx);
 
-function applyPartySettings(s, t, tau, d, m, b) {
-  const profile = PRESET_DSP.party;
-  const mWall = Math.min(m, 1);
-  const wallHz = 380 + (1 - mWall) * 3800;
-  s.wallLP.frequency.setTargetAtTime(wallHz, t, tau);
-  s.wallLP.Q.setTargetAtTime(Math.min(1.7, 0.55 + m * 1.45), t, tau);
-  s.vocalDip.gain.setTargetAtTime(-(2 + m * 7.5 + d * 3), t, tau);
+  // bass passes through walls well, scaled by bass slider
+  s.bassGain.gain.setTargetAtTime(0.5 + b * 0.8, t, tau);
 
-  s.bodyGain.gain.setTargetAtTime((0.16 + (1 - d) * 0.62 * (1 - m * 0.5)) * profile.bodyMul, t, tau);
-  s.wetGain.gain.setTargetAtTime((0.12 + d * 0.95) * profile.wetMul, t, tau);
-  s.bassGain.gain.setTargetAtTime((0.44 + b * 1.22) * profile.bassMul, t, tau);
-  s.mixGain.gain.setTargetAtTime(1.06, t, tau);
-}
+  // body: stays mostly present; depth reduces it (you're farther away)
+  s.bodyGain.gain.setTargetAtTime(0.9 - d * 0.45, t, tau);
 
-function applyHallSettings(s, t, tau, d, m, b, presetId) {
-  const profile = PRESET_DSP.hall;
-  const pre = profile.preDelay + d * 0.055;
-  s.preDelay.delayTime.setTargetAtTime(pre, t, tau);
+  // reverb: depth drives how much room sound you hear
+  s.wetGain.gain.setTargetAtTime(0.05 + d * 0.65, t, tau);
 
-  // depth = how far into the hall (wet vs dry), muffle = tail damping, bass = mud cut
-  s.dryGain.gain.setTargetAtTime(0.55 - d * 0.42, t, tau);
-  s.wetGain.gain.setTargetAtTime((0.2 + d * 0.65) * profile.combMix * 2.2, t, tau);
-  s.convWet.gain.setTargetAtTime(0.18 + d * 0.82, t, tau);
-  s.hallHP.frequency.setTargetAtTime(100 + b * 120, t, tau);
-  s.hallDamp.frequency.setTargetAtTime(profile.dampBase - m * 3400, t, tau);
-  s.mixGain.gain.setTargetAtTime(0.9, t, tau);
-}
-
-function applyLofiSettings(s, t, tau, d, m, b, presetId) {
-  const profile = PRESET_DSP.lofi;
-  const lpHz = 900 + (1 - m) * 2800;
-  s.lofiLP.frequency.setTargetAtTime(lpHz, t, tau);
-  s.lofiBody.gain.setTargetAtTime(0.35 + (1 - d) * 0.4, t, tau);
-  s.lofiWet.gain.setTargetAtTime(0.08 + d * 0.35, t, tau);
-  s.hissGain.gain.setTargetAtTime(profile.hiss * (0.4 + m * 0.35) * d, t, tau);
+  // mix unity — limiter handles any peaks
   s.mixGain.gain.setTargetAtTime(0.85, t, tau);
 }
 
+function applyHallSettings(s, t, tau, d, m, b) {
+  const profile = PRESET_DSP.hall;
+  setDelay(s.preDelay, s.preDelayMax ?? HALL_PRE_DELAY_MAX, 0.04 + d * 0.08, t, tau);
+
+  s.dryGain.gain.setTargetAtTime(0.65 - d * 0.5, t, tau);
+  s.earlyGain.gain.setTargetAtTime(0.15 + d * 0.6, t, tau);
+  s.convWet.gain.setTargetAtTime(0.08 + d * 0.55, t, tau);
+
+  // dampLP: muffle=0 → bright 6kHz, muffle=1 → dark 800Hz
+  setFreq(s.dampLP, 6000 - m * 5200, t, tau, s.audioCtx);
+
+  // bass slider cuts low mud in a big hall
+  s.hallHP.frequency.setTargetAtTime(40 + b * 140, t, tau);
+
+  s.mixGain.gain.setTargetAtTime(0.88, t, tau);
+}
+
+function applyLofiSettings(s, t, tau, d, m, b) {
+  // warmth LP: muffle=0 → 4000Hz (warmer tape), muffle=1 → 1200Hz (really rolled off)
+  const lpHz = 4000 - m * 2800;
+  setFreq(s.warmLP, lpHz, t, tau, s.audioCtx);
+
+  // warmth bump: more muffle = more mid warmth
+  s.tapeWarm.gain.setTargetAtTime(2 + m * 5, t, tau);
+  setFreq(s.tapeWarm, 280 + b * 200, t, tau, s.audioCtx);
+
+  // gain: depth slider controls overall signal level + saturation feel
+  s.lofiGain.gain.setTargetAtTime(0.55 + d * 0.35, t, tau);
+
+  // hiss: always some, more with depth (playing level)
+  const profile = PRESET_DSP.lofi;
+  s.hissGain.gain.setTargetAtTime(profile.hiss * (0.5 + d * 0.8 + m * 0.4), t, tau);
+
+  s.mixGain.gain.setTargetAtTime(0.9, t, tau);
+}
+
+function applyNightcoreSettings(s, t, tau, d, m, b) {
+  const profile = PRESET_DSP[s.presetId] ?? PRESET_DSP.nightcore;
+
+  // depth: 0% = pitch 1.0 (no shift), 50% = 1.25 (~5 semitones up), 100% = 1.5 (~7 semitones)
+  const pitch = clamp(profile.baseRate + (d - 0.5) * profile.rateDepth * 2, 0.5, 2.0);
+  // Drive pitch via port message (most reliable path to the AudioWorklet thread)
+  s.pitchNode?.port?.postMessage({ pitch });
+
+  // sparkle: high shelf — 0% = 0dB (no boost), 100% = 14dB
+  // frequency sweeps down from 7kHz→5kHz as sparkle increases, widening the boosted treble band
+  s.ncBright.gain.setTargetAtTime(m * 14, t, tau);
+  setFreq(s.ncBright, profile.brightHz - m * 2000, t, tau, s.audioCtx);
+
+  s.ncBody.gain.setTargetAtTime(0.75 + b * 0.4, t, tau);
+  s.ncMix.gain.setTargetAtTime(1.0, t, tau);
+}
+
+// ─────────────────────────────────────────────────
+// LEVEL METER
+// ─────────────────────────────────────────────────
 function readMeter(tabId) {
   const s = sessions.get(tabId);
   if (!s?.analyser) return { level: 0, bands: [] };
@@ -313,9 +445,9 @@ function readMeter(tabId) {
   const bandCount = 9;
   const chunk = Math.max(1, Math.floor(fd.length / bandCount));
   const bands = [];
-  for (let b = 0; b < bandCount; b++) {
+  for (let bi = 0; bi < bandCount; bi++) {
     let sum = 0;
-    const start = b * chunk;
+    const start = bi * chunk;
     const end = Math.min(fd.length, start + chunk);
     for (let i = start; i < end; i++) sum += fd[i];
     bands.push(Math.min(1, (sum / (end - start)) / 165));
@@ -324,6 +456,9 @@ function readMeter(tabId) {
   return { level: Math.min(1, rms * 3.2), bands };
 }
 
+// ─────────────────────────────────────────────────
+// SESSION TEARDOWN
+// ─────────────────────────────────────────────────
 async function stopProcessing(tabId, immediate = false) {
   const s = sessions.get(tabId);
   if (!s) return;
@@ -349,171 +484,162 @@ function teardownSession(s) {
   try { if (s.audioCtx?.state !== 'closed') s.audioCtx.close(); } catch (_) {}
 }
 
-// ── Hall helpers: Schroeder comb / allpass ──
-
+// ─────────────────────────────────────────────────
+// COMB FILTER (for hall reverb)
+// ─────────────────────────────────────────────────
 function makeComb(ctx, delaySec, feedback, dampHz) {
-  const max = delaySec + 0.05;
+  const max = Math.max(delaySec + 0.05, delaySec * 1.25);
   const delay = ctx.createDelay(max);
-  delay.delayTime.value = delaySec;
+  delay.delayTime.value = Math.min(delaySec, max);
   const fb = gain(ctx, feedback);
   const damp = filter(ctx, 'lowpass', dampHz, 0.5);
-  const input = gain(ctx, 1);
-  const output = gain(ctx, 1);
-  input.connect(delay);
+  const inp = gain(ctx, 1);
+  const out = gain(ctx, 1);
+  inp.connect(delay);
   delay.connect(damp);
   damp.connect(fb);
   fb.connect(delay);
-  delay.connect(output);
-  input.connect(output);
-  return { input, output };
+  delay.connect(out);
+  inp.connect(out);
+  return { input: inp, output: out };
 }
 
+// ─────────────────────────────────────────────────
+// WOW & FLUTTER (lo-fi)
+// ─────────────────────────────────────────────────
 function startWow(s) {
   stopWow(s);
   if (!s.wowDelay) return;
   const profile = PRESET_DSP.lofi;
   const ctx = s.audioCtx;
-  const base = 0.009;
+  const base = 0.008;
   const depth = profile.wowDepth;
   s.wowPhase = 0;
   s.wowTimer = setInterval(() => {
     if (!s.wowDelay || ctx.state === 'closed') return;
     s.wowPhase += 0.09;
-    const dt = base + depth * Math.sin(2 * Math.PI * 0.42 * s.wowPhase);
-    try { s.wowDelay.delayTime.setTargetAtTime(dt, ctx.currentTime, 0.06); } catch (_) {}
-  }, 110);
+    // two oscillators for organic flutter feel
+    const wow   = depth * 0.7 * Math.sin(2 * Math.PI * 0.48 * s.wowPhase);
+    const flutter = depth * 0.3 * Math.sin(2 * Math.PI * 6.2 * s.wowPhase);
+    const dt = base + wow + flutter;
+    try { setDelay(s.wowDelay, s.wowDelayMax ?? WOW_DELAY_MAX, dt, ctx.currentTime, 0.04); } catch (_) {}
+  }, 80);
 }
 
 function stopWow(s) {
   if (s.wowTimer) { clearInterval(s.wowTimer); s.wowTimer = null; }
 }
 
+// ─────────────────────────────────────────────────
+// HISS SOURCE (lo-fi)
+// ─────────────────────────────────────────────────
 function makeHiss(ctx, seed) {
   const len = ctx.sampleRate * 2;
   const buf = ctx.createBuffer(1, len, ctx.sampleRate);
   const data = buf.getChannelData(0);
   const rand = seededRandom(seed ^ 0xbad);
-  for (let i = 0; i < len; i++) data[i] = (rand() * 2 - 1) * 0.12;
+  for (let i = 0; i < len; i++) data[i] = (rand() * 2 - 1) * 0.15;
   const src = ctx.createBufferSource();
   src.buffer = buf;
   src.loop = true;
   return src;
 }
 
-// ── IR builders ──
+// ─────────────────────────────────────────────────
+// IMPULSE RESPONSE GENERATORS
+// ─────────────────────────────────────────────────
 
-function buildPartyIR(ctx, profile) {
+// Bathroom IR: small tiled room, RT60 ~0.45s
+// Dense noise tail with discrete early reflections off hard walls
+function buildBathroomIR(ctx) {
   const sr = ctx.sampleRate;
-  const dur = 0.42 + profile.irSize * 2.1;
-  const len = Math.floor(sr * dur);
+  const rt60 = 0.45;
+  // length: enough for the full decay
+  const len = Math.ceil(sr * rt60 * 1.6);
   const buf = ctx.createBuffer(2, len, sr);
-  const decay = 10 - profile.irSize * 6;
-  const taps = [0.007, 0.013, 0.021, 0.031, 0.043, 0.057, 0.074, 0.092];
+  const rand = seededRandom(0x9e3779b1);
+
+  // Discrete early reflections (hard tile, first-order reflections from each wall)
+  const erMs = [5, 9, 14, 20, 27, 36, 47, 60];
+  const erAmp = [0.72, 0.58, 0.50, 0.44, 0.36, 0.28, 0.22, 0.16];
+
+  // Decay rate for -60dB in rt60 seconds
+  const decayRate = Math.log(1000) / rt60;
 
   for (let ch = 0; ch < 2; ch++) {
     const data = buf.getChannelData(ch);
-    const spread = ch === 0 ? 1 : 1.04;
-    for (let i = 0; i < len; i++) {
-      const time = i / sr;
-      const env = Math.exp(-time * decay);
-      let s = 0;
-      for (const tap of taps) {
-        const t = tap * spread;
-        const w = 0.0012;
-        if (Math.abs(time - t) < w) {
-          s += (1 - Math.abs(time - t) / w) * (0.42 + profile.erMul * 0.32);
-        }
-      }
-      if (time > 0.03) s += Math.sin(i * (0.31 + ch * 0.04)) * 0.008 * env;
-      data[i] = s * profile.irGain * Math.min(1, i / (sr * 0.003));
+
+    // Early reflections: sharp spikes at specific delays
+    for (let e = 0; e < erMs.length; e++) {
+      const idx = Math.floor(erMs[e] * sr / 1000);
+      // slight stereo difference on alternating reflections
+      const stereoSign = (ch === 1 && e % 2 === 0) ? -1 : 1;
+      if (idx < len) data[idx] += stereoSign * erAmp[e];
+      // tiny smear on adjacent samples for anti-aliasing
+      if (idx + 1 < len) data[idx + 1] += stereoSign * erAmp[e] * 0.25;
+      if (idx - 1 >= 0) data[idx - 1] += stereoSign * erAmp[e] * 0.1;
+    }
+
+    // Dense diffuse tail starting at ~30ms (where discrete reflections
+    // become too dense to separate — the reverb cloud)
+    const tailStart = Math.floor(0.030 * sr);
+    // Slight stereo independence: different rand state per channel
+    if (ch === 1) { for (let i = 0; i < 200; i++) rand(); }
+    for (let i = tailStart; i < len; i++) {
+      const t = i / sr;
+      const env = Math.exp(-decayRate * t);
+      // HF rolloff in tail (tiles absorb some HF after many bounces)
+      const hfFactor = t < 0.1 ? 1 : Math.exp(-(t - 0.1) * 3.5);
+      data[i] += (rand() * 2 - 1) * 0.22 * env * hfFactor;
     }
   }
-  normalizeBuffer(buf, 0.48);
+
+  normalizeBuffer(buf, 0.62);
   return buf;
 }
 
+// Hall IR: large concert hall, RT60 ~2.2s
+// Long noise tail with pre-delay early reflection cluster
 function buildHallIR(ctx) {
   const sr = ctx.sampleRate;
-  const dur = 3.6;
-  const len = Math.floor(sr * dur);
+  const rt60 = 2.2;
+  const len = Math.ceil(sr * rt60 * 1.2);
   const buf = ctx.createBuffer(2, len, sr);
-  const rand = seededRandom(PRESET_DSP.hall.seed);
+  const rand = seededRandom(0xc0ffee01);
+
+  const decayRate = Math.log(1000) / rt60;
+
+  // Early reflection cluster (first-order in a large hall)
+  const erMs = [12, 22, 35, 52, 74, 102, 138, 180, 230];
+  const erAmp = [0.55, 0.44, 0.36, 0.30, 0.25, 0.20, 0.16, 0.12, 0.09];
 
   for (let ch = 0; ch < 2; ch++) {
     const data = buf.getChannelData(ch);
-    for (let i = 0; i < len; i++) {
-      const time = i / sr;
-      const env = Math.exp(-time * 1.8);
-      const hf = time > 0.08 ? Math.pow(0.5, time * 2.2) : 1;
-      // Sparse cathedral reflections — not dense bathroom tiles
-      let er = 0;
-      for (const tap of [0.018, 0.031, 0.048, 0.071, 0.11, 0.16, 0.23]) {
-        if (Math.abs(time - tap) < 0.002) er += (1 - Math.abs(time - tap) / 0.002) * 0.38;
-      }
-      let s = er * (0.6 + rand() * 0.15);
-      if (time > 0.12) s += Math.sin(i * 0.17 + ch) * 0.012 * env * hf;
-      data[i] = s * Math.min(1, i / (sr * 0.006));
+
+    for (let e = 0; e < erMs.length; e++) {
+      const idx = Math.floor(erMs[e] * sr / 1000);
+      const s2 = ch === 1 ? Math.floor(sr * 0.0012) : 0;
+      if (idx + s2 < len) data[idx + s2] += erAmp[e] * (ch === 0 ? 1 : 0.9);
     }
-    if (ch === 1) {
-      const d = Math.floor(sr * 0.0018);
-      for (let i = len - 1; i >= d; i--) data[i] = data[i] * 0.78 + data[i - d] * 0.22;
+
+    const tailStart = Math.floor(0.08 * sr);
+    if (ch === 1) { for (let i = 0; i < 300; i++) rand(); }
+    for (let i = tailStart; i < len; i++) {
+      const t = i / sr;
+      const env = Math.exp(-decayRate * t);
+      // Gradual HF rolloff in long tail
+      const hfFactor = Math.exp(-t * 0.8);
+      data[i] += (rand() * 2 - 1) * 0.18 * env * (0.4 + hfFactor * 0.6);
     }
   }
-  normalizeBuffer(buf, 0.5);
-  return buf;
-}
 
-function buildLofiIR(ctx, profile) {
-  const sr = ctx.sampleRate;
-  const dur = 0.3 + profile.irSize * 0.45;
-  const len = Math.floor(sr * dur);
-  const buf = ctx.createBuffer(2, len, sr);
-  const taps = [0.005, 0.011, 0.019];
-
-  for (let ch = 0; ch < 2; ch++) {
-    const data = buf.getChannelData(ch);
-    for (let i = 0; i < len; i++) {
-      const time = i / sr;
-      const env = Math.exp(-time * 16);
-      let s = 0;
-      for (const tap of taps) {
-        if (Math.abs(time - tap) < 0.001) s += (1 - Math.abs(time - tap) / 0.001) * 0.5;
-      }
-      if (time > 0.02) s += Math.sin(i * 0.43) * 0.006 * env;
-      data[i] = s * 0.14 * Math.min(1, i / (sr * 0.003));
-    }
-  }
-  normalizeBuffer(buf, 0.35);
-  return buf;
-}
-
-function buildNoiseIR(ctx, { dur, decay, gain, erMul, seed, erBright }) {
-  const sr = ctx.sampleRate;
-  const len = Math.floor(sr * dur);
-  const buf = ctx.createBuffer(2, len, sr);
-  const rand = seededRandom(seed);
-  for (let ch = 0; ch < 2; ch++) {
-    const data = buf.getChannelData(ch);
-    for (let i = 0; i < len; i++) {
-      const time = i / sr;
-      const env = Math.exp(-time * decay);
-      const hf = time > 0.05 ? Math.pow(0.5, time * (erBright ? 3.5 : 5)) : 1;
-      const er = time < 0.016 ? Math.exp(-time * 130) * 1.6 * erMul : 0;
-      let s = rand() * 2 - 1;
-      s = s * env * (0.45 + hf * 0.55) + er * (rand() * 2 - 1) * 0.5;
-      data[i] = s * gain * Math.min(1, i / (sr * 0.004));
-    }
-    if (ch === 1) {
-      const d = Math.floor(sr * 0.0007);
-      for (let i = len - 1; i >= d; i--) data[i] = data[i] * 0.85 + data[i - d] * 0.15;
-    }
-  }
   normalizeBuffer(buf, 0.55);
   return buf;
 }
 
-// ── utilities ──
-
+// ─────────────────────────────────────────────────
+// UTILITY NODES
+// ─────────────────────────────────────────────────
 function wire(...nodes) {
   for (let i = 0; i < nodes.length - 1; i++) nodes[i].connect(nodes[i + 1]);
 }
@@ -532,7 +658,21 @@ function filter(ctx, type, freq, q) {
   return f;
 }
 
-function clamp01(v) { return Math.max(0, Math.min(1, v ?? 0)); }
+function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+function clamp01(v) { return clamp(v ?? 0, 0, 1); }
+
+function setDelay(node, maxSec, sec, t, tau) {
+  if (!node) return;
+  const v = clamp(sec, 0, maxSec);
+  if (t != null && tau != null) node.delayTime.setTargetAtTime(v, t, tau);
+  else node.delayTime.value = v;
+}
+
+
+function setFreq(filterNode, hz, t, tau, ctx) {
+  const nyquist = ((ctx?.sampleRate) ?? 48000) / 2 - 20;
+  filterNode.frequency.setTargetAtTime(clamp(hz, 20, nyquist), t, tau);
+}
 
 function makeCrushCurve(bits) {
   const steps = Math.pow(2, bits);

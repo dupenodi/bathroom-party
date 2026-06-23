@@ -1,8 +1,8 @@
 const PRESET_CATALOG = [
   {
     id: 'party', group: 'Bathroom', label: 'Bathroom', family: 'party',
-    depth: 50, muffle: 50, bass: 50,
-    dsp: { irSize: 0.38, irGain: 0.32, wetMul: 1.05, bodyMul: 1.0, bassMul: 1.18, erMul: 0.88, seed: 0x9e3779b1 },
+    depth: 55, muffle: 60, bass: 60,
+    dsp: {},
     ui: {
       off: 'off',
       on: 'through the wall',
@@ -12,16 +12,16 @@ const PRESET_CATALOG = [
       vizActive: 'listening',
       vizLive: 'live',
       sliders: {
-        depth:  ['Depth', 'how far in'],
+        depth:  ['Depth', 'how far away'],
         muffle: ['Muffle', 'wall thickness'],
         bass:   ['Bass', 'thump through walls']
       }
     }
   },
   {
-    id: 'hall', group: 'Hall', label: 'Hall', family: 'hall',
-    depth: 94, muffle: 14, bass: 30,
-    dsp: { preDelay: 0.072, combMix: 0.22, dampBase: 4200, seed: 0xc0ffee01 },
+    id: 'hall', group: 'Bathroom', label: 'Hall', family: 'hall',
+    depth: 70, muffle: 25, bass: 40,
+    dsp: { preDelay: 0.072, combMix: 0.22, dampBase: 5000, seed: 0xc0ffee01 },
     ui: {
       off: 'off',
       on: 'hall reverb',
@@ -31,16 +31,16 @@ const PRESET_CATALOG = [
       vizActive: 'listening',
       vizLive: 'live',
       sliders: {
-        depth:  ['Distance', 'how deep inside'],
+        depth:  ['Distance', 'how deep in the hall'],
         muffle: ['Damping', 'tail brightness'],
-        bass:   ['Low cut', 'keep mud out']
+        bass:   ['Low cut', 'remove mud']
       }
     }
   },
   {
-    id: 'lofi', group: 'Lo-fi', label: 'Lo-fi', family: 'lofi',
-    depth: 42, muffle: 78, bass: 48,
-    dsp: { irSize: 0.12, crushBits: 9, wowDepth: 0.0028, hiss: 0.006, seed: 0x10aded01 },
+    id: 'lofi', group: 'Bathroom', label: 'Lo-fi', family: 'lofi',
+    depth: 55, muffle: 65, bass: 50,
+    dsp: { crushBits: 9, wowDepth: 0.0038, hiss: 0.009, seed: 0x10aded01 },
     ui: {
       off: 'off',
       on: 'lo-fi tape',
@@ -50,9 +50,28 @@ const PRESET_CATALOG = [
       vizActive: 'listening',
       vizLive: 'live',
       sliders: {
-        depth:  ['Room', 'how boxy'],
+        depth:  ['Drive', 'tape level'],
         muffle: ['Warmth', 'roll off highs'],
-        bass:   ['Weight', 'low-end body']
+        bass:   ['Body', 'low-end weight']
+      }
+    }
+  },
+  {
+    id: 'nightcore', group: 'Effects', label: 'Nightcore', family: 'nightcore',
+    depth: 50, muffle: 50, bass: 50,
+    dsp: { baseRate: 1.25, brightHz: 7000, rateDepth: 0.25, seed: 0x91c0de02 },
+    ui: {
+      off: 'off',
+      on: 'nightcore',
+      loading: 'connecting…',
+      stopping: 'disconnecting…',
+      vizIdle: 'no signal',
+      vizActive: 'listening',
+      vizLive: 'live',
+      sliders: {
+        depth:  ['Speed', 'faster & higher pitch'],
+        muffle: ['Sparkle', 'anime brightness'],
+        bass:   ['Bass', 'low-end weight']
       }
     }
   }

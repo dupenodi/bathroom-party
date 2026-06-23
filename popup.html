@@ -9,9 +9,10 @@
     body {
       width: 280px;
       background: #0c0c0a;
-      color: #c8c3b8;
+      color: #dedad2;
       font-family: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
       font-size: 12px;
+      font-weight: 450;
       -webkit-font-smoothing: antialiased;
     }
 
@@ -22,9 +23,9 @@
 
     .logo {
       font-size: 13px;
-      font-weight: 600;
+      font-weight: 700;
       letter-spacing: -0.01em;
-      color: #e6e0d4;
+      color: #f0ece4;
     }
 
     .logo em {
@@ -85,12 +86,13 @@
     .meter-label {
       margin-top: 8px;
       font-size: 9px;
+      font-weight: 600;
       letter-spacing: 0.1em;
       text-transform: uppercase;
-      color: #3a3a34;
+      color: #888880;
     }
 
-    .meter.on .meter-label { color: #c9a84c66; }
+    .meter.on .meter-label { color: #c9a84cbb; }
 
     /* ── Presets ── */
     .presets {
@@ -105,14 +107,15 @@
     .preset {
       flex: 1;
       background: transparent;
-      border: 1px solid #222218;
-      color: #6a6a5e;
+      border: 1px solid #363630;
+      color: #b8b8aa;
       font-family: inherit;
       font-size: 10px;
-      font-weight: 500;
+      font-weight: 600;
       padding: 6px 4px;
       border-radius: 4px;
       cursor: pointer;
+      text-align: center;
       transition: color 0.12s, border-color 0.12s, background 0.12s;
     }
 
@@ -138,8 +141,8 @@
 
     .power-status {
       font-size: 11px;
-      font-weight: 500;
-      color: #5a5a50;
+      font-weight: 600;
+      color: #a8a89a;
       white-space: nowrap;
       overflow: hidden;
       text-overflow: ellipsis;
@@ -209,20 +212,22 @@
 
     .slider-name {
       font-size: 10px;
-      font-weight: 600;
+      font-weight: 700;
       letter-spacing: 0.08em;
       text-transform: uppercase;
-      color: #5a5a50;
+      color: #c8c8b8;
     }
 
     .slider-hint {
       font-size: 9px;
-      color: #3a3a34;
+      font-weight: 500;
+      color: #888878;
     }
 
     .slider-val {
       font-size: 10px;
-      color: #5a5a50;
+      font-weight: 600;
+      color: #b8b8a8;
       font-variant-numeric: tabular-nums;
     }
 
@@ -299,7 +304,8 @@
 
     .remember-text {
       font-size: 9px;
-      color: #4a4a42;
+      font-weight: 500;
+      color: #96968a;
       max-width: 140px;
       overflow: hidden;
       text-overflow: ellipsis;
@@ -313,9 +319,9 @@
       height: 24px;
       padding: 0;
       background: none;
-      border: 1px solid #2a2a22;
+      border: 1px solid #363630;
       border-radius: 4px;
-      color: #5a5a50;
+      color: #96968a;
       cursor: pointer;
       display: flex;
       align-items: center;
@@ -369,12 +375,13 @@
 
     .status-text {
       font-size: 9px;
+      font-weight: 600;
       letter-spacing: 0.08em;
       text-transform: uppercase;
-      color: #3a3a34;
+      color: #888880;
     }
 
-    .status-text.on { color: #c9a84c55; }
+    .status-text.on { color: #c9a84ccc; }
   </style>
 </head>
 <body>
@@ -414,9 +421,9 @@
           <span class="slider-name" id="depthName">Depth</span>
           <span class="slider-hint" id="depthHint"> — how far in</span>
         </div>
-        <span class="slider-val" id="depthVal">50%</span>
+        <span class="slider-val" id="depthVal">55%</span>
       </div>
-      <input type="range" id="depthSlider" min="0" max="100" value="50">
+      <input type="range" id="depthSlider" min="0" max="100" value="55">
     </div>
 
     <div class="slider-row">
@@ -425,9 +432,9 @@
           <span class="slider-name" id="muffleName">Muffle</span>
           <span class="slider-hint" id="muffleHint"> — wall thickness</span>
         </div>
-        <span class="slider-val" id="muffleVal">50%</span>
+        <span class="slider-val" id="muffleVal">60%</span>
       </div>
-      <input type="range" id="muffleSlider" min="0" max="100" value="50">
+      <input type="range" id="muffleSlider" min="0" max="100" value="60">
     </div>
 
     <div class="slider-row">
@@ -436,9 +443,9 @@
           <span class="slider-name" id="bassName">Bass</span>
           <span class="slider-hint" id="bassHint"> — thump through walls</span>
         </div>
-        <span class="slider-val" id="bassVal">50%</span>
+        <span class="slider-val" id="bassVal">60%</span>
       </div>
-      <input type="range" id="bassSlider" min="0" max="100" value="50">
+      <input type="range" id="bassSlider" min="0" max="100" value="60">
     </div>
   </section>
 

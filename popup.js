@@ -1,9 +1,3 @@
-const LEGACY_PRESETS = {
-  bathroom: 'party', party: 'party', 'party-a': 'party', 'party-b': 'party', 'party-c': 'party',
-  hall: 'hall', 'hall-a': 'hall', 'hall-b': 'hall', 'hall-c': 'hall',
-  lofi: 'lofi', 'lofi-a': 'lofi', 'lofi-b': 'lofi', 'lofi-c': 'lofi'
-};
-
 const toggle     = document.getElementById('toggle');
 const powerSub   = document.getElementById('powerSub');
 const meter      = document.getElementById('meter');
@@ -56,7 +50,6 @@ function isCustomized() {
 
 function normalizePresetId(id) {
   if (!id) return DEFAULT_PRESET_ID;
-  if (LEGACY_PRESETS[id]) return LEGACY_PRESETS[id];
   return PRESET_CATALOG.some(p => p.id === id) ? id : DEFAULT_PRESET_ID;
 }
 
@@ -187,7 +180,7 @@ function buildPresets() {
     el.className = 'preset';
     el.type = 'button';
     el.textContent = p.label;
-    el.title = p.group;
+    el.title = p.label;
     el.dataset.id = p.id;
     el.addEventListener('click', () => onPresetClick(p));
     row.appendChild(el);
@@ -325,8 +318,12 @@ function formatCaptureError(raw) {
     return 'tab closed — refresh and try again';
   if (msg.includes('processor') || msg.includes('offscreen'))
     return "audio didn't start — toggle off and on";
-  if (msg.includes('stream') || msg.includes('not found'))
-    return 'press play on the tab first';
+  if (msg.includes('stream expired') || msg.includes('invalid state'))
+    return 'connection expired — toggle off and on';
+  if (msg.includes('no tab audio') || msg.includes('no audio track') || msg.includes('start playback'))
+    return 'press play on the video, then toggle again';
+  if (msg.includes('could not open tab audio'))
+    return 'start playback on the tab, then try again';
   return "couldn't connect — click the page and try again";
 }
 
